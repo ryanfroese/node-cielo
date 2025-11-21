@@ -1,4 +1,13 @@
 /**
+ * Demo script for Cielo HVAC control
+ *
+ * REQUIRED: Set TWOCAPTCHA_API_KEY environment variable before running
+ * Example: export TWOCAPTCHA_API_KEY="your-api-key"
+ *
+ * Usage: node demo.js -u username -p password -i ip -m macAddress
+ */
+
+/**
  * Includes
  */
 const commandLineArgs = require('command-line-args');
@@ -48,7 +57,8 @@ function sleep(ms) {
   );
   console.log('Connecting...');
   try {
-    await api.establishConnection(
+    // Use automated captcha solving with the new API
+    await api.establishConnectionWithAutoSolve(
       OPTIONS.username,
       OPTIONS.password,
       OPTIONS.ip,
@@ -64,7 +74,8 @@ function sleep(ms) {
       console.log(hvac.toString());
     });
 
-    const temp = api.hvacs[0].getTemperature();
+    // Get initial temperature and convert to number
+    const temp = parseInt(api.hvacs[0].getTemperature());
 
     console.log("Sending power off");
     await api.hvacs[0].powerOff(api);
@@ -81,7 +92,7 @@ function sleep(ms) {
     });
 
     console.log("Sending temperature 68");
-    await api.hvacs[0].setTemperature("68", api);
+    await api.hvacs[0].setTemperature(68, api);
     await sleep(10000);
     api.hvacs.forEach((hvac) => {
       console.log(hvac.toString());

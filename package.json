@@ -1,14 +1,16 @@
 {
   "name": "node-smartcielo-ws",
-  "version": "1.1.5",
+  "version": "2.0.0",
   "description": "NodeJS interface for the SmartCielo remote AC control API",
   "dependencies": {
     "https-proxy-agent": "^5.0.0",
     "node-fetch": "^2.6.1",
     "node-html-parser": "^1.2.16",
     "ws": "^7.2.5",
-    "command-line-args": "^5.1.1",
-    "crypto-js": "^4.0.0"
+    "command-line-args": "^5.1.1"
+  },
+  "optionalDependencies": {
+    "puppeteer": "^21.0.0"
   },
   "devDependencies": {},
   "scripts": {
@@ -23,6 +25,9 @@
     "smarthvac",
     "minisplit"
   ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "author": "Ryan Froese",
   "license": "MIT",
   "bugs": {

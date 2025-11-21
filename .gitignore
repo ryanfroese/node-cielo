@@ -1,3 +1,21 @@
 node_modules
 .DS_Store
 package-lock.json
+traffic-captures/*.json
+traffic-captures/*.har
+traffic-captures/*.mitm
+traffic-captures/*.mitm.old
+traffic-captures/*.log
+traffic-captures/*.log.old
+
+# Debug logs
+cielo-debug.log
+
+# Environment variables (2Captcha API keys, etc.)
+.env
+.env.local
+.env.*.local
+
+# Test credentials (if you create any test config files)
+config.local.js
+credentials.json

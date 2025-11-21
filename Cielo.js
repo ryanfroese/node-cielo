@@ -1,6 +1,7 @@
 const querystring = require("querystring");
 const fetch = require("node-fetch");
 const WebSocket = require("ws");
+const crypto = require("crypto");
 
 // Constants
 const API_HOST = "api.smartcielo.com";
@@ -10,6 +11,8 @@ const DEFAULT_POWER = "off";
 const DEFAULT_MODE = "auto";
 const DEFAULT_FAN = "auto";
 const DEFAULT_TEMPERATURE = 75;
+const API_KEY = "XiZ0PkwbNlQmu3Zrt7XV3EHBj1b1bHU9k02MSJW2";
+const APP_VERSION = "1.4.4";
 
 // Exports
 class CieloAPIConnection {
@@ -17,8 +20,11 @@ class CieloAPIConnection {
   #sessionID;
   #userID;
   #accessToken;
+  #refreshToken;
+  #expiresIn;
   #agent;
   #commandCount = 0;
+  #previousPowerStates = {}; // Track previous power states by MAC address
 
   /**
    * WebSocket connection to API
@@ -81,6 +87,16 @@ class CieloAPIConnection {
     // Extract the relevant HVACs from the results
     for (const device of deviceInfo.data.listDevices) {
       if (macAddresses.includes(device.macAddress)) {
+        // Debug log device info
+        const fs = require('fs');
+        fs.appendFileSync('cielo-debug.log', `\n[${new Date().toISOString()}] SUBSCRIBING TO DEVICE:\n${JSON.stringify({
+          macAddress: device.macAddress,
+          deviceName: device.deviceName,
+          applianceId: device.applianceId,
+          fwVersion: device.fwVersion,
+          deviceTypeVersion: device.deviceTypeVersion
+        }, null, 2)}\n`);
+
         let hvac = new CieloHVAC(
           device.macAddress,
           device.deviceName,
@@ -107,26 +123,177 @@ class CieloAPIConnection {
    * Obtains authentication and socket connection information from the API.
    *
    * @param {string} username The username to login with
-   * @param {string} password The password for the provided username
+   * @param {string} password The password for the provided username (plaintext - will be hashed)
    * @param {string} ip The public IP address of the network the HVACs are on
-   * @param {string} agent Optional parameter specifying the agent type to
-   *      identify as during the request
+   * @param {string} agent Optional parameter specifying the agent type to identify as during the request
+   * @param {string} captchaToken Optional captcha token for exact web UI matching (recommended for Apple Home)
    * @returns {Promise<void>} A Promise containing nothing if resolved, and
    *      an error if one occurs during authentication
    */
-  async establishConnection(username, password, ip, agent) {
-    // TODO: Add ability to recognize authentication failure
-    await this.#getAccessTokenAndSessionId(username, password, ip).then(
+  async establishConnection(username, password, ip, agent, captchaToken) {
+    // Store agent for proxy support
+    this.#agent = agent;
+
+    await this.#getAccessTokenAndSessionId(username, password, ip, captchaToken).then(
       (data) => {
         // console.log(data);
         // Save the results
         this.#sessionID = data.sessionId;
         this.#userID = data.userId;
         this.#accessToken = data.accessToken;
+        this.#refreshToken = data.refreshToken;
+        this.#expiresIn = data.expiresIn;
         return;
       }
     );
     return Promise.resolve();
+  }
+
+  /**
+   * Get the current refresh token (for persistent storage)
+   *
+   * Store this token securely to enable login without captcha.
+   * Use refreshAccessToken() to get a new access token from a stored refresh token.
+   *
+   * @returns {string} The current refresh token
+   */
+  getRefreshToken() {
+    return this.#refreshToken;
+  }
+
+  /**
+   * Get the current access token expiration time
+   *
+   * @returns {number} Unix timestamp when the access token expires
+   */
+  getExpiresIn() {
+    return this.#expiresIn;
+  }
+
+  /**
+   * Refresh the access token using the stored refresh token
+   *
+   * This allows reconnecting WITHOUT captcha by using a previously saved refresh token.
+   * This is how the iOS app stays logged in - it refreshes tokens instead of re-logging in.
+   *
+   * @param {string} refreshToken Optional refresh token to use (defaults to stored token)
+   * @returns {Promise<void>} A Promise that resolves when the token is refreshed
+   */
+  async refreshAccessToken(refreshToken) {
+    const tokenToUse = refreshToken || this.#refreshToken;
+
+    if (!tokenToUse) {
+      return Promise.reject(new Error('No refresh token available. Must login first.'));
+    }
+
+    const refreshUrl = new URL(
+      `${API_HTTP_PROTOCOL}${API_HOST}/web/token/refresh?refreshToken=${tokenToUse}`
+    );
+
+    const refreshPayload = {
+      agent: this.#agent,
+      headers: {
+        accept: "application/json, text/plain, */*",
+        authorization: tokenToUse,
+        "content-type": "application/json; charset=utf-8",
+        "x-api-key": API_KEY,
+      },
+      method: "GET",
+    };
+
+    return fetch(refreshUrl, refreshPayload)
+      .then((response) => {
+        console.log('Refresh response status:', response.status);
+        return response.json().then(json => ({ status: response.status, body: json }));
+      })
+      .then(({status, body}) => {
+        console.log('Refresh response body:', JSON.stringify(body, null, 2));
+        if (body.data) {
+          // Update stored tokens
+          this.#accessToken = body.data.accessToken;
+          this.#refreshToken = body.data.refreshToken;
+          this.#expiresIn = body.data.expiresIn;
+          return Promise.resolve();
+        } else {
+          return Promise.reject(new Error('Token refresh failed (' + status + '): ' + (body.message || body.error?.message || 'Unknown error')));
+        }
+      })
+      .catch((error) => {
+        return Promise.reject(new Error('Token refresh failed: ' + error.message));
+      });
+  }
+
+  /**
+   * Establish connection with automated captcha solving
+   *
+   * This method automatically solves the Cloudflare Turnstile captcha using 2Captcha service
+   * before establishing the connection. No manual captcha token required!
+   *
+   * REQUIREMENTS:
+   * 1. Install: npm install (solveCaptcha.js is already in the project)
+   * 2. Sign up at https://2captcha.com/ and add funds
+   * 3. Set environment variables:
+   *    - TWOCAPTCHA_API_KEY: Your 2Captcha API key
+   *    - CIELO_TURNSTILE_SITEKEY: The Cloudflare Turnstile siteKey from Cielo's login page
+   *
+   * To find the siteKey, see instructions in solveCaptcha.js
+   *
+   * @param {string} username The account username/email
+   * @param {string} password The account password (will be automatically SHA-256 hashed)
+   * @param {string} ip The public IP address to authenticate from (or '0.0.0.0')
+   * @param {*} agent Optional parameter specifying the agent type (for proxy support)
+   * @param {Object} captchaOptions Optional 2Captcha configuration (see solveCaptcha.js)
+   * @returns {Promise<void>} A Promise that resolves when connected, rejects on error
+   *
+   * @example
+   * // Set environment variables first:
+   * // export TWOCAPTCHA_API_KEY="your-api-key"
+   * // export CIELO_TURNSTILE_SITEKEY="0x..."
+   *
+   * const api = new CieloAPIConnection(...);
+   * await api.establishConnectionWithAutoSolve(
+   *   'your@email.com',
+   *   'yourpassword',
+   *   '73.162.98.163'
+   * );
+   */
+  async establishConnectionWithAutoSolve(username, password, ip, agent, captchaOptions = {}) {
+    // Lazy-load the captcha solver to avoid requiring it if not used
+    const { solveCieloCaptcha } = require('./solveCaptcha.js');
+
+    console.log('🔓 Solving captcha automatically...');
+
+    // Solve the captcha using 2Captcha
+    const captchaToken = await solveCieloCaptcha(captchaOptions);
+
+    console.log('✅ Captcha solved! Logging in...');
+
+    // Use the regular establishConnection with the solved token
+    return this.establishConnection(username, password, ip, agent, captchaToken);
+  }
+
+  /**
+   * Get all devices on the account
+   *
+   * Returns a list of all devices associated with the account.
+   * Useful for discovering available HVACs before subscribing.
+   *
+   * @returns {Promise<Array>} Array of device objects with macAddress, deviceName, etc.
+   *
+   * @example
+   * const devices = await api.getAllDevices();
+   * const macAddresses = devices.map(d => d.macAddress);
+   * await api.subscribeToHVACs(macAddresses);
+   */
+  async getAllDevices() {
+    const deviceInfo = await this.#getDeviceInfo();
+
+    if (deviceInfo.error) {
+      throw new Error(`Failed to get devices: ${deviceInfo.error.message}`);
+    }
+
+    // Return array of devices (structure is data.listDevices)
+    return deviceInfo.data?.listDevices || [];
   }
 
   /**
@@ -142,15 +309,26 @@ class CieloAPIConnection {
         "&token=" +
         this.#accessToken
     );
-    const connectPayload = {
-      sessionId: this.#agent,
-      token: this.#accessToken,
+
+    // Match the web UI's WebSocket connection headers exactly
+    const wsOptions = {
+      headers: {
+        'Origin': 'https://home.cielowigle.com',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+      }
     };
-    this.#ws = new WebSocket(connectUrl, connectPayload);
+
+    this.#ws = new WebSocket(connectUrl, wsOptions);
 
     // Start the socket when opened
     this.#ws.on("open", () => {
       this.#startSocket();
+    });
+
+    // Log errors for debugging
+    this.#ws.on("error", (error) => {
+      console.error("WebSocket error:", error);
+      this.#errorCallback(error);
     });
 
     // Provide notification to the error callback when the connection is
@@ -162,6 +340,13 @@ class CieloAPIConnection {
     // Subscribe to status updates
     this.#ws.on("message", (message) => {
       const data = JSON.parse(message);
+
+      // Write to debug log file
+      const fs = require('fs');
+      const debugLog = `\n[${new Date().toISOString()}] RECEIVED MESSAGE:\n${JSON.stringify(data, null, 2)}\n`;
+      fs.appendFileSync('cielo-debug.log', debugLog);
+
+      // New API uses message_type field to identify message type
       if (
         data.message_type &&
         typeof data.message_type === "string" &&
@@ -169,36 +354,49 @@ class CieloAPIConnection {
         data.action &&
         typeof data.action === "object"
       ) {
-        const type = data.mid;
+        const messageType = data.message_type;
         const status = data.action;
-        const roomTemp = data.lat_env_var.temperature;
         const thisMac = data.mac_address;
-        switch (type) {
-          case "WEB":
-            this.hvacs.forEach((hvac, index) => {
-              if (hvac.getMacAddress() === thisMac) {
-                this.hvacs[index].updateState(
-                  status.power,
-                  status.temp,
-                  status.mode,
-                  status.fanspeed
-                );
+
+        // Handle StateUpdate messages (replaces both WEB and Heartbeat)
+        if (messageType === "StateUpdate") {
+          // Update HVAC state
+          this.hvacs.forEach((hvac, index) => {
+            if (hvac.getMacAddress() === thisMac) {
+              this.hvacs[index].updateState(
+                status.power,
+                status.temp,
+                status.mode,
+                status.fanspeed
+              );
+
+              // Update room temperature and humidity if available
+              if (data.lat_env_var) {
+                const roomTemp = data.lat_env_var.temperature;
+                const humidity = data.lat_env_var.humidity;
+
+                if (roomTemp !== undefined) {
+                  this.hvacs[index].updateRoomTemperature(roomTemp);
+                }
+
+                // Store humidity if available (could add to CieloHVAC in future)
+                // For now just pass it through callback
               }
-            });
-            if (this.#commandCallback !== undefined) {
-              this.#commandCallback(status);
+
+              // Update previous power state
+              this.#previousPowerStates[thisMac] = status.power;
             }
-            break;
-          case "Heartbeat":
-            this.hvacs.forEach((hvac, index) => {
-              if (hvac.getMacAddress() === thisMac) {
-                this.hvacs[index].updateRoomTemperature(roomTemp);
-              }
-            });
-            if (this.#temperatureCallback !== undefined) {
-              this.#temperatureCallback(roomTemp);
-            }
-            break;
+          });
+
+          // Trigger command callback for state changes
+          if (this.#commandCallback !== undefined) {
+            this.#commandCallback(status);
+          }
+
+          // Trigger temperature callback if temperature data available
+          if (this.#temperatureCallback !== undefined && data.lat_env_var && data.lat_env_var.temperature) {
+            this.#temperatureCallback(data.lat_env_var.temperature);
+          }
         }
       }
     });
@@ -218,14 +416,53 @@ class CieloAPIConnection {
 
   // API Calls
   /**
-   * Extracts the appUser and sessionID values from the hidden HTML inputs on
-   * the index page.
+   * Hashes a password using SHA-256 to match the web UI behavior
    *
-   * @returns {Promise<string[]>} An array containing the appUser and
-   *      sessionID
+   * @param {string} password The plaintext password
+   * @returns {string} The SHA-256 hashed password (lowercase hex)
    */
-  async #getAccessTokenAndSessionId(username, password, ip) {
-    const appUserUrl = new URL(API_HTTP_PROTOCOL + API_HOST + "/web/login");
+  #hashPassword(password) {
+    return crypto.createHash('sha256').update(password).digest('hex');
+  }
+
+  /**
+   * Authenticates with the Cielo API and obtains access token, session ID,
+   * and user ID.
+   *
+   * @param {string} username The username to login with
+   * @param {string} password The password for the provided username
+   * @param {string} ip The public IP address of the network the HVACs are on
+   * @param {string} captchaToken Optional captcha token for web UI compatibility
+   * @returns {Promise<Object>} A Promise containing the login data
+   */
+  async #getAccessTokenAndSessionId(username, password, ip, captchaToken) {
+    const appUserUrl = new URL(API_HTTP_PROTOCOL + API_HOST + "/auth/login");
+
+    // Hash the password to match web UI behavior
+    const hashedPassword = this.#hashPassword(password);
+
+    const requestBody = {
+      user: {
+        userId: username,
+        password: hashedPassword,
+        mobileDeviceId: "WEB",
+        deviceTokenId: "WEB",
+        appType: "WEB",
+        appVersion: APP_VERSION,
+        timeZone: "America/Los_Angeles",
+        mobileDeviceName: "chrome",
+        deviceType: "WEB",
+        ipAddress: ip || "0.0.0.0",
+        isSmartHVAC: 0,
+        locale: "en",
+      }
+    };
+
+    // Include captchaToken if provided (matches web UI exactly)
+    if (captchaToken) {
+      requestBody.captchaToken = captchaToken;
+    }
+
     const appUserPayload = {
       agent: this.#agent,
       method: "POST",
@@ -238,34 +475,29 @@ class CieloAPIConnection {
         origin: "https://home.cielowigle.com",
         pragma: "no-cache",
         referer: "https://home.cielowigle.com/",
-        "x-api-key": "7xTAU4y4B34u8DjMsODlEyprRRQEsbJ3IB7vZie4",
+        "x-api-key": API_KEY,
       },
-      body: JSON.stringify({
-        user: {
-          userId: username,
-          password: password,
-          mobileDeviceId: "WEB",
-          deviceTokenId: "WEB",
-          appType: "WEB",
-          appVersion: "1.0",
-          timeZone: "America/Los_Angeles",
-          mobileDeviceName: "chrome",
-          deviceType: "WEB",
-          ipAddress: ip,
-          isSmartHVAC: 0,
-          locale: "en",
-        },
-      }),
+      body: JSON.stringify(requestBody),
     };
+
+    console.log("Request body:", JSON.stringify(requestBody, null, 2));
+
     const loginData = await fetch(appUserUrl, appUserPayload)
       .then((response) => response.json())
       .then((responseJSON) => {
-        // console.log(responseJSON);
+        console.log("Login response:", JSON.stringify(responseJSON, null, 2));
+
+        // Check for successful response
+        if (responseJSON.status !== 200 || !responseJSON.data || !responseJSON.data.user) {
+          throw new Error(`Login failed: ${responseJSON.message || 'Unknown error'}`);
+        }
+
         const initialLoginData = responseJSON.data.user;
         return initialLoginData;
       })
       .catch((error) => {
-        console.error(error);
+        console.error("Login error:", error);
+        throw error;
       });
     return loginData;
   }
@@ -420,15 +652,19 @@ class CieloAPIConnection {
     performedAction,
     performedValue
   ) {
+    // Convert temp to string for actions object (API expects string, not number)
+    const tempValue = isAction && performedAction === "temp" ? String(performedValue) : temp;
+
     return {
-      power: power,
+      power: isAction && performedAction === "power" ? performedValue : power,
       mode: isAction && performedAction === "mode" ? performedValue : mode,
-      fanspeed: fanspeed,
-      temp: isAction && performedAction === "temp" ? performedValue : temp,
-      swing: "auto/stop",
+      fanspeed: isAction && performedAction === "fanspeed" ? performedValue : fanspeed,
+      temp: tempValue,
+      swing: "adjust",
+      swinginternal: "",
       turbo: "off",
-      light: "off",
-      oldPower: power,
+      light: "on/off",
+      followme: "off",
     };
   }
 
@@ -442,18 +678,32 @@ class CieloAPIConnection {
    */
   #buildCommandPayload(hvac, performedAction, performedActionValue) {
     const commandCount = this.#commandCount++;
+    const macAddress = hvac.getMacAddress();
+
+    // Track previous power state for this device
+    const oldPower = this.#previousPowerStates[macAddress] || "off";
+
+    // Update power state if this is a power command
+    if (performedAction === "power") {
+      this.#previousPowerStates[macAddress] = performedActionValue;
+    }
+
     const result = JSON.stringify({
       action: "actionControl",
-      macAddress: hvac.getMacAddress(),
-      deviceTypeVersion: hvac.getDeviceTypeVersion() || "BI01",
-      fwVersion: hvac.getFwVersion(),
       actionSource: "WEB",
       applianceType: "AC",
+      macAddress: macAddress,
+      deviceTypeVersion: hvac.getDeviceTypeVersion() || "BI01",
+      fwVersion: hvac.getFwVersion(),
       applianceId: hvac.getApplianceID(),
       actionType: performedAction,
       actionValue: performedActionValue,
-      connection_source: 2,
-      token: this.#accessToken,
+      connection_source: 0,
+      user_id: this.#userID,
+      preset: 0,
+      oldPower: oldPower,
+      myRuleConfiguration: {},
+      mid: "WEB",
       actions: this.#buildCommand(
         hvac.getTemperature(),
         hvac.getPower(),
@@ -463,8 +713,7 @@ class CieloAPIConnection {
         performedAction,
         performedActionValue
       ),
-      mid: this.#sessionID,
-      application_version: "1.0.0",
+      application_version: APP_VERSION,
       ts: Math.round(Date.now() / 1000),
     });
     return result;
@@ -479,18 +728,22 @@ class CieloAPIConnection {
    * @returns {Promise<void>}
    */
   async sendCommand(hvac, performedAction, performedActionValue) {
+    const payload = this.#buildCommandPayload(hvac, performedAction, performedActionValue);
+
+    // Write to debug log file
+    const fs = require('fs');
+    const debugLog = `\n[${new Date().toISOString()}] SENDING COMMAND:\n${JSON.stringify(JSON.parse(payload), null, 2)}\n`;
+    fs.appendFileSync('cielo-debug.log', debugLog);
+
     return new Promise((resolve, reject) => {
-      this.#ws.send(
-        this.#buildCommandPayload(hvac, performedAction, performedActionValue),
-        (error) => {
-          if (error) {
-            log.error(error);
-            reject(error);
-          } else {
-            resolve();
-          }
+      this.#ws.send(payload, (error) => {
+        if (error) {
+          fs.appendFileSync('cielo-debug.log', `ERROR: ${error.message}\n`);
+          reject(error);
+        } else {
+          resolve();
         }
-      );
+      });
     });
   }
 }
@@ -527,11 +780,12 @@ class CieloHVAC {
     this.#applianceID = applianceID;
     this.#fwVersion = fwVersion;
 
-    if (deviceTypeVersion.startsWith("BI")) {
+    if (deviceTypeVersion && (deviceTypeVersion.startsWith("BI") || deviceTypeVersion.startsWith("BP"))) {
       this.#deviceTypeVersion = deviceTypeVersion;
     } else {
-      // Defaults back to BI01 if the deviceTypeVersion is not valid
-      this.#deviceTypeVersion = "BI01";
+      // Defaults back to BP01 if the deviceTypeVersion is not valid
+      console.warn(`Invalid deviceTypeVersion: ${deviceTypeVersion}, defaulting to BP01`);
+      this.#deviceTypeVersion = "BP01";
     }
   }
 
