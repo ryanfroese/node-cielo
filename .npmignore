@@ -1,0 +1,38 @@
+# Traffic capture analysis (development only)
+traffic-captures/
+
+# Development-only test files (keep demo.js and test-interactive.js)
+test-auto-captcha.js
+test-with-token.js
+test-ios-login.js
+test-refresh-token.js
+test-find-sitekey.js
+
+# Development-only captcha tools (keep solveCaptcha.js - it's required!)
+find-sitekey*
+getCaptchaToken.js
+setup-2captcha.sh
+
+# Development documentation
+AUTOMATED_CAPTCHA.md
+SUMMARY.md
+USAGE_WITH_CAPTCHA.md
+QUICKSTART_AUTOMATED_CAPTCHA.md
+HOMEBRIDGE_INTEGRATION.md
+CONNECTION_MANAGEMENT.md
+CONFIG_IMPROVEMENTS.md
+CLAUDE.md
+
+# Development artifacts
+cielo-debug.log
+curl-examples.txt
+*.log
+
+# IDE and development tools
+.claude/
+.vscode/
+.idea/
+
+# Git files
+.git/
+.gitignore
