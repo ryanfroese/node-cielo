@@ -129,24 +129,28 @@ function getFromEnv() {
 }
 
 /**
- * Convenience function for solving Cielo captcha using environment variables
+ * Convenience function for solving Cielo captcha
  *
- * Set these environment variables:
- * - TWOCAPTCHA_API_KEY: Your 2Captcha API key
- * - CIELO_RECAPTCHA_SITEKEY: The reCAPTCHA siteKey from Cielo's login page
+ * Can provide API key via options.apiKey or TWOCAPTCHA_API_KEY environment variable
+ * Can provide siteKey via options.siteKey or CIELO_RECAPTCHA_SITEKEY environment variable
  *
- * @param {Object} options Optional configuration (same as solve2Captcha)
+ * @param {Object} options Optional configuration
+ * @param {string} options.apiKey 2Captcha API key (overrides environment variable)
+ * @param {string} options.siteKey reCAPTCHA siteKey (overrides environment variable)
  * @returns {Promise<string>} The captcha token
  */
 async function solveCieloCaptcha(options = {}) {
-  const apiKey = process.env.TWOCAPTCHA_API_KEY;
-  const siteKey = process.env.CIELO_RECAPTCHA_SITEKEY || '6Lewqu8nAAAAAOudyOyScwjI4dFukcDvJZprnZB6'; // Default to known siteKey
+  // Check options first, then fall back to environment variables
+  const apiKey = options.apiKey || process.env.TWOCAPTCHA_API_KEY;
+  const siteKey = options.siteKey || process.env.CIELO_RECAPTCHA_SITEKEY || '6Lewqu8nAAAAAOudyOyScwjI4dFukcDvJZprnZB6'; // Default to known siteKey
 
   if (!apiKey) {
     throw new Error(
-      'TWOCAPTCHA_API_KEY environment variable not set.\n' +
-      'Get your API key from https://2captcha.com/ and set it:\n' +
-      'export TWOCAPTCHA_API_KEY="your-api-key-here"'
+      'TWOCAPTCHA_API_KEY not configured.\n' +
+      'Either:\n' +
+      '1. Pass it via options: { apiKey: "your-key" }\n' +
+      '2. Set environment variable: export TWOCAPTCHA_API_KEY="your-key"\n' +
+      'Get your API key from https://2captcha.com/'
     );
   }
 
