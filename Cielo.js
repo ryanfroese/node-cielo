@@ -67,11 +67,12 @@ class CieloAPIConnection {
    * Creates the hvacs array using the provided macAddresses and establishes
    * the WebSockets connection to the API to receive updates.
    *
-   * @param {string[]} macAddresses MAC addresses of desired HVACs
+   * @param {string[]} macAddresses Optional MAC addresses of desired HVACs.
+   *                                 If not provided or empty, subscribes to ALL devices on account.
    * @returns {Promise<void>} A Promise containing nothing if resolved, error
    *      if an error occurs establishing the WebSocket connection
    */
-  async subscribeToHVACs(macAddresses) {
+  async subscribeToHVACs(macAddresses = []) {
     // Clear the array of any previously subscribed HVACs
     this.hvacs = [];
     this.#commandCount = 0;
@@ -84,9 +85,12 @@ class CieloAPIConnection {
     // Ensure the request was successful
     if (deviceInfo.error) return Promise.reject(deviceInfo.error);
 
+    // If no MAC addresses specified, subscribe to ALL devices
+    const subscribeToAll = !macAddresses || macAddresses.length === 0;
+
     // Extract the relevant HVACs from the results
     for (const device of deviceInfo.data.listDevices) {
-      if (macAddresses.includes(device.macAddress)) {
+      if (subscribeToAll || macAddresses.includes(device.macAddress)) {
         // Debug log device info
         const fs = require('fs');
         fs.appendFileSync('cielo-debug.log', `\n[${new Date().toISOString()}] SUBSCRIBING TO DEVICE:\n${JSON.stringify({
