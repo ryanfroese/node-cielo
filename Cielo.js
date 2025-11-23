@@ -6,7 +6,7 @@ const crypto = require("crypto");
 // Constants
 const API_HOST = "api.smartcielo.com";
 const API_HTTP_PROTOCOL = "https://";
-const PING_INTERVAL = 5 * 60 * 1000;
+const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes - refresh before 15min disconnect
 const DEFAULT_POWER = "off";
 const DEFAULT_MODE = "auto";
 const DEFAULT_FAN = "auto";
@@ -324,20 +324,52 @@ class CieloAPIConnection {
 
     this.#ws = new WebSocket(connectUrl, wsOptions);
 
+    // WebSocket ping/pong keepalive
+    let pingInterval;
+    let pongTimeout;
+
     // Start the socket when opened
     this.#ws.on("open", () => {
+      console.log('[Keepalive] WebSocket opened - starting ping/pong keepalive');
       this.#startSocket();
+
+      // Send ping every 5 minutes
+      pingInterval = setInterval(() => {
+        if (this.#ws.readyState === WebSocket.OPEN) {
+          console.log('[Keepalive] Sending WebSocket ping...');
+          this.#ws.ping();
+
+          // Set timeout to detect if server doesn't respond
+          pongTimeout = setTimeout(() => {
+            console.error('[Keepalive] Pong timeout - server not responding');
+            this.#ws.terminate();
+          }, 30000); // 30 second timeout
+        }
+      }, 5 * 60 * 1000); // 5 minutes
+    });
+
+    // Handle pong response
+    this.#ws.on("pong", () => {
+      console.log('[Keepalive] Received pong from server');
+      if (pongTimeout) {
+        clearTimeout(pongTimeout);
+        pongTimeout = null;
+      }
     });
 
     // Log errors for debugging
     this.#ws.on("error", (error) => {
       console.error("WebSocket error:", error);
+      if (pingInterval) clearInterval(pingInterval);
+      if (pongTimeout) clearTimeout(pongTimeout);
       this.#errorCallback(error);
     });
 
     // Provide notification to the error callback when the connection is
     // closed
     this.#ws.on("close", () => {
+      if (pingInterval) clearInterval(pingInterval);
+      if (pongTimeout) clearTimeout(pongTimeout);
       this.#errorCallback(new Error("Connection Closed."));
     });
 
@@ -484,13 +516,9 @@ class CieloAPIConnection {
       body: JSON.stringify(requestBody),
     };
 
-    console.log("Request body:", JSON.stringify(requestBody, null, 2));
-
     const loginData = await fetch(appUserUrl, appUserPayload)
       .then((response) => response.json())
       .then((responseJSON) => {
-        console.log("Login response:", JSON.stringify(responseJSON, null, 2));
-
         // Check for successful response
         if (responseJSON.status !== 200 || !responseJSON.data || !responseJSON.data.user) {
           throw new Error(`Login failed: ${responseJSON.message || 'Unknown error'}`);
@@ -554,43 +582,45 @@ class CieloAPIConnection {
   }
 
   /**
-   * Starts the WebSocket connection and periodically pings it to keep it
-   * alive
+   * Starts the WebSocket connection with keepalive
+   *
+   * The WebSocket ping/pong strategy (in #connect) is sufficient to prevent
+   * the 15-minute disconnect timeout. Application-level messages are not needed.
    *
    * @returns {Promise<any>} A Promise containing nothing if resolved, and an
    *      error if rejected
    */
   async #startSocket() {
-    // Periodically ping the socket to keep it alive, seems to be unnessesary with current API
-    // setInterval(async () => {
-    //   try {
-    //     console.log('pinging socket');
-    //     await this.#pingSocket();
-    //   } catch (error) {
-    //     this.#errorCallback(error);
-    //   }
-    // }, PING_INTERVAL);
+    // WebSocket ping/pong (every 5 minutes) handles keepalive
+    // Tested and confirmed working for 30+ minutes
+    // No additional application-level messages needed
 
     return Promise.resolve();
   }
 
   /**
-   *This refreshes the token by returning a refreshed token, may not be neccesary with the new API
-   * @returns
+   * Refreshes the access token using the refresh token to keep the connection alive
+   * This prevents the 15-minute disconnect and avoids captcha re-authentication
+   * @returns {Promise<any>} Response from refresh endpoint
    */
   async #pingSocket() {
+    if (!this.#refreshToken) {
+      console.warn('No refresh token available for keepalive ping');
+      return;
+    }
+
     const time = new Date();
     const pingUrl = new URL(
       "https://api.smartcielo.com/web/token/refresh" +
         "?refreshToken=" +
-        this.#accessToken
+        this.#refreshToken  // FIXED: Use refreshToken, not accessToken
     );
     const pingPayload = {
       agent: this.#agent,
       headers: {
         accept: "application/json, text/plain, */*",
         "accept-language": "en-US,en;q=0.9",
-        authorization: this.#accessToken,
+        authorization: this.#refreshToken,  // FIXED: Use refreshToken for auth
         "cache-control": "no-cache",
         "content-type": "application/json; charset=utf-8",
         pragma: "no-cache",
@@ -599,7 +629,7 @@ class CieloAPIConnection {
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "cross-site",
-        "x-api-key": "7xTAU4y4B34u8DjMsODlEyprRRQEsbJ3IB7vZie4",
+        "x-api-key": API_KEY,
       },
       referrer: "https://home.cielowigle.com/",
       referrerPolicy: "strict-origin-when-cross-origin",
@@ -608,25 +638,33 @@ class CieloAPIConnection {
       mode: "cors",
       credentials: "include",
     };
-    const pingResponse = await fetch(pingUrl, pingPayload)
-      .then((response) => response.json())
-      .then((responseJSON) => {
+
+    try {
+      const response = await fetch(pingUrl, pingPayload);
+      const responseJSON = await response.json();
+
+      if (responseJSON.status === 200 && responseJSON.data) {
+        // Update tokens with refreshed values
+        this.#accessToken = responseJSON.data.accessToken;
+        this.#refreshToken = responseJSON.data.refreshToken;
+        this.#expiresIn = responseJSON.data.expiresIn;
+
         const expires = new Date(responseJSON.data.expiresIn * 1000);
-        // Calculate the difference between the two dates in minutes
         const diffMinutes = Math.round((expires - time) / 60000);
 
-        // Log the difference to the console
         console.log(
-          `The refreshed token will expire in ${diffMinutes} minutes.`
+          `[Keepalive] Token refreshed successfully - expires in ${diffMinutes} minutes`
         );
         return responseJSON;
-      })
-      .catch((error) => {
-        console.error(error);
-        return;
-      });
-
-    return pingResponse;
+      } else {
+        console.error('[Keepalive] Token refresh failed:', responseJSON.message || 'Unknown error');
+        throw new Error('Token refresh failed');
+      }
+    } catch (error) {
+      console.error('[Keepalive] Error refreshing token:', error.message);
+      // Don't throw - let the normal error handling reconnect if needed
+      return null;
+    }
   }
 
   // Utility methods

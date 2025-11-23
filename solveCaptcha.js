@@ -33,6 +33,40 @@ const fetch = require('node-fetch');
  * @param {number} options.timeout Maximum time to wait in ms (default: 180000 = 3 minutes)
  * @returns {Promise<string>} The captcha token
  */
+/**
+ * Helper function to retry network requests with exponential backoff
+ */
+async function fetchWithRetry(url, maxRetries = 3, initialDelay = 2000) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url);
+      return await response.json();
+    } catch (error) {
+      lastError = error;
+
+      // Check if it's a network/DNS error that's worth retrying
+      const isNetworkError = error.message.includes('EAI_AGAIN') ||
+                            error.message.includes('ENOTFOUND') ||
+                            error.message.includes('ETIMEDOUT') ||
+                            error.message.includes('ECONNREFUSED');
+
+      if (isNetworkError && attempt < maxRetries) {
+        const delay = initialDelay * Math.pow(2, attempt - 1); // Exponential backoff
+        console.log(`[2Captcha] Network error (${error.message.split(',')[0]}) - retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      // Don't retry non-network errors or if we've exhausted retries
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
 async function solve2Captcha(apiKey, siteKey, options = {}) {
   const pageUrl = options.pageUrl || 'https://home.cielowigle.com';
   const pollingInterval = options.pollingInterval || 5000;
@@ -48,10 +82,10 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
 
   console.log('[2Captcha] Submitting captcha to 2Captcha service...');
 
-  // Submit captcha to 2Captcha using reCAPTCHA v2 method
+  // Submit captcha to 2Captcha using reCAPTCHA v2 method with retry
   const submitUrl = `https://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${siteKey}&pageurl=${encodeURIComponent(pageUrl)}&json=1`;
 
-  const submitResponse = await fetch(submitUrl).then(r => r.json());
+  const submitResponse = await fetchWithRetry(submitUrl);
 
   if (submitResponse.status !== 1) {
     throw new Error(`2Captcha submission failed: ${submitResponse.request}`);
@@ -72,7 +106,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     attempts++;
 
     const resultUrl = `https://2captcha.com/res.php?key=${apiKey}&action=get&id=${captchaId}&json=1`;
-    const result = await fetch(resultUrl).then(r => r.json());
+    const result = await fetchWithRetry(resultUrl);
 
     if (result.status === 1) {
       console.log(`[2Captcha] ✅ Captcha solved! (took ${attempts} attempts, ${Math.round((Date.now() - startTime) / 1000)}s)`);
@@ -81,7 +115,6 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
 
     if (result.request === 'CAPCHA_NOT_READY') {
       // Still processing, continue polling
-      console.log(`[2Captcha] Still processing... (attempt ${attempts})`);
       await new Promise(resolve => setTimeout(resolve, pollingInterval));
       continue;
     }

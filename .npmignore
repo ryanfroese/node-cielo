@@ -7,6 +7,7 @@ test-with-token.js
 test-ios-login.js
 test-refresh-token.js
 test-find-sitekey.js
+test-keepalive.js
 
 # Development-only captcha tools (keep solveCaptcha.js - it's required!)
 find-sitekey*
@@ -27,6 +28,10 @@ CLAUDE.md
 cielo-debug.log
 curl-examples.txt
 *.log
+
+# Environment variables (credentials)
+.env
+.env.*
 
 # IDE and development tools
 .claude/

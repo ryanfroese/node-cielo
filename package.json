@@ -1,15 +1,15 @@
 {
   "name": "node-smartcielo-ws",
-  "version": "2.0.3",
+  "version": "2.0.7",
   "description": "NodeJS interface for the SmartCielo remote AC control API",
   "dependencies": {
+    "command-line-args": "^5.1.1",
+    "dotenv": "^17.2.3",
     "https-proxy-agent": "^5.0.0",
     "node-fetch": "^2.6.1",
     "node-html-parser": "^1.2.16",
-    "ws": "^7.2.5",
-    "command-line-args": "^5.1.1"
+    "ws": "^7.2.5"
   },
-  "devDependencies": {},
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
