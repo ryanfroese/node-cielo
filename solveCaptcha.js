@@ -22,6 +22,25 @@
 
 const fetch = require('node-fetch');
 
+// Output goes through a caller-supplied logger when there is one, so a
+// Homebridge host can attribute and level-filter it instead of having raw
+// console output land in the shared log.
+let log = {
+  info: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args),
+  error: (...args) => console.error(...args),
+};
+
+function setLogger(logger) {
+  if (logger) {
+    log = {
+      info: (logger.info || log.info).bind(logger),
+      warn: (logger.warn || log.warn).bind(logger),
+      error: (logger.error || log.error).bind(logger),
+    };
+  }
+}
+
 /**
  * Solve reCAPTCHA v2 captcha using 2Captcha service
  *
@@ -54,7 +73,7 @@ async function fetchWithRetry(url, maxRetries = 3, initialDelay = 2000) {
 
       if (isNetworkError && attempt < maxRetries) {
         const delay = initialDelay * Math.pow(2, attempt - 1); // Exponential backoff
-        console.log(`[2Captcha] Network error (${error.message.split(',')[0]}) - retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        log.warn(`[2Captcha] Network error (${error.message.split(',')[0]}) - retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
@@ -115,7 +134,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     throw new Error('reCAPTCHA siteKey is required. See instructions in solveCaptcha.js');
   }
 
-  console.log('[2Captcha] Submitting captcha to 2Captcha service...');
+  log.info('[2Captcha] Submitting captcha to 2Captcha service...');
 
   // Submit captcha to 2Captcha using reCAPTCHA v2 method with retry
   const submitUrl = `https://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${siteKey}&pageurl=${encodeURIComponent(pageUrl)}&json=1`;
@@ -127,8 +146,8 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
   }
 
   const captchaId = submitResponse.request;
-  console.log(`[2Captcha] Captcha submitted. ID: ${captchaId}`);
-  console.log('[2Captcha] Waiting for solution (this usually takes 10-30 seconds)...');
+  log.info(`[2Captcha] Captcha submitted. ID: ${captchaId}`);
+  log.info('[2Captcha] Waiting for solution (this usually takes 10-30 seconds)...');
 
   // Wait before first check (captchas typically take 10-30 seconds)
   await new Promise(resolve => setTimeout(resolve, 10000));
@@ -144,7 +163,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     const result = await fetchWithRetry(resultUrl);
 
     if (result.status === 1) {
-      console.log(`[2Captcha] ✅ Captcha solved! (took ${attempts} attempts, ${Math.round((Date.now() - startTime) / 1000)}s)`);
+      log.info(`[2Captcha] Captcha solved! (took ${attempts} attempts, ${Math.round((Date.now() - startTime) / 1000)}s)`);
       return result.request; // This is the captcha token
     }
 
@@ -222,13 +241,14 @@ async function solveCieloCaptcha(options = {}) {
     );
   }
 
-  console.log(`[2Captcha] Using siteKey: ${siteKey}`);
+  log.info(`[2Captcha] Using siteKey: ${siteKey}`);
 
   return solve2Captcha(apiKey, siteKey, options);
 }
 
 module.exports = {
   PermanentCaptchaError,
+  setLogger,
   solve2Captcha,
   solveCieloCaptcha,
   useManualToken,

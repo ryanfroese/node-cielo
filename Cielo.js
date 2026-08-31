@@ -135,6 +135,13 @@ class CieloAPIConnection {
         warn: (logger.warn || defaultLogger.warn).bind(logger),
         error: (logger.error || defaultLogger.error).bind(logger),
       };
+      // The captcha solver is a separate module with its own output; route it
+      // through the same logger so nothing bypasses the host's log.
+      try {
+        require('./solveCaptcha.js').setLogger(logger);
+      } catch (err) {
+        this.#log.debug('Could not configure captcha solver logger:', err.message);
+      }
     }
   }
 
