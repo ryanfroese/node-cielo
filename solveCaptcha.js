@@ -67,6 +67,41 @@ async function fetchWithRetry(url, maxRetries = 3, initialDelay = 2000) {
   throw lastError;
 }
 
+/**
+ * 2Captcha failures that will never succeed on retry, no matter how long we
+ * wait: the account is out of money, the key is wrong, or the key is blocked.
+ * Retrying these just spins - and once a balance is topped back up, an
+ * unattended retry loop is exactly what drains it again. Callers should treat
+ * a PermanentCaptchaError as "stop and tell the operator", not "back off".
+ */
+const PERMANENT_2CAPTCHA_ERRORS = [
+  'ERROR_ZERO_BALANCE',
+  'ERROR_WRONG_USER_KEY',
+  'ERROR_KEY_DOES_NOT_EXIST',
+  'ERROR_IP_NOT_ALLOWED',
+  'IP_BANNED',
+  'ERROR_BAD_DUPLICATES',
+];
+
+class PermanentCaptchaError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PermanentCaptchaError';
+    this.permanent = true;
+  }
+}
+
+function raise2CaptchaError(code, phase) {
+  const detail = `2Captcha ${phase} failed: ${code}`;
+  if (PERMANENT_2CAPTCHA_ERRORS.includes(code)) {
+    const hint = code === 'ERROR_ZERO_BALANCE'
+      ? ' - your 2Captcha account is out of funds. Top it up at https://2captcha.com/ and restart the plugin.'
+      : ' - check the twocaptcha_api_key in your plugin configuration.';
+    throw new PermanentCaptchaError(detail + hint);
+  }
+  throw new Error(detail);
+}
+
 async function solve2Captcha(apiKey, siteKey, options = {}) {
   const pageUrl = options.pageUrl || 'https://home.cielowigle.com';
   const pollingInterval = options.pollingInterval || 5000;
@@ -88,7 +123,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
   const submitResponse = await fetchWithRetry(submitUrl);
 
   if (submitResponse.status !== 1) {
-    throw new Error(`2Captcha submission failed: ${submitResponse.request}`);
+    raise2CaptchaError(submitResponse.request, 'submission');
   }
 
   const captchaId = submitResponse.request;
@@ -120,7 +155,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     }
 
     // Any other response is an error
-    throw new Error(`2Captcha error: ${result.request}`);
+    raise2CaptchaError(result.request, 'solve');
   }
 
   throw new Error(`2Captcha timeout after ${timeout}ms`);
@@ -193,6 +228,7 @@ async function solveCieloCaptcha(options = {}) {
 }
 
 module.exports = {
+  PermanentCaptchaError,
   solve2Captcha,
   solveCieloCaptcha,
   useManualToken,
