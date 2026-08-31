@@ -44,3 +44,4 @@ curl-examples.txt
 
 # Tests (development only)
 tests/
+API_STATUS.md
