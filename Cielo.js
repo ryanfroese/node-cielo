@@ -22,6 +22,20 @@ const APP_VERSION = "1.4.4";
 // Homebridge host that file grew past 10MB and broke nightly UI backups.
 const DEBUG_ENABLED = process.env.CIELO_DEBUG === "1";
 
+// Reusing a refresh token would avoid paying for a captcha on every reconnect,
+// which is by far the biggest available saving. It is disabled because the only
+// known refresh endpoint, /web/token/refresh, sits behind AWS IAM (SigV4) auth:
+// it answers a bearer-token request with
+//   "Authorization header requires 'Credential' parameter ... 'Signature' ...
+//    'SignedHeaders' ... 'X-Amz-Date'"
+// which we cannot produce without AWS credentials. It appears to be a leftover
+// from the pre-v2.0 API. Attempting it just adds a failed round-trip to every
+// reconnect before falling back to a captcha anyway.
+//
+// Re-enable by setting CIELO_ENABLE_REFRESH_LOGIN=1 once a working refresh
+// endpoint is captured from the web app; the fallback path is already correct.
+const REFRESH_TOKEN_LOGIN_ENABLED = process.env.CIELO_ENABLE_REFRESH_LOGIN === "1";
+
 /**
  * Wraps a handler so it runs at most once, and always runs the supplied
  * cleanup first.
@@ -35,6 +49,18 @@ const DEBUG_ENABLED = process.env.CIELO_DEBUG === "1";
  * @param {function} handler Runs only on the first invocation
  * @returns {function} The single-shot notifier
  */
+function describeApiError(err) {
+  if (!err) {
+    return "unknown error";
+  }
+  if (typeof err === "string") {
+    return err;
+  }
+  const code = err.code ? `${err.code}: ` : "";
+  const message = err.message || err.error || JSON.stringify(err);
+  return `${code}${message}`;
+}
+
 function createSingleShotNotifier(cleanup, handler) {
   let fired = false;
   return (...args) => {
@@ -165,8 +191,24 @@ class CieloAPIConnection {
     // Get the initial information on all devices
     const deviceInfo = await this.#getDeviceInfo();
 
-    // Ensure the request was successful
-    if (deviceInfo.error) return Promise.reject(deviceInfo.error);
+    // Ensure the request was successful. Reject with a real Error: rejecting
+    // with the API's bare object meant consumers logged "[object Object]" and
+    // the actual cause was invisible.
+    if (!deviceInfo) {
+      return Promise.reject(
+        new Error("Device list request returned no response (see earlier log for cause).")
+      );
+    }
+    if (deviceInfo.error) {
+      return Promise.reject(new Error(`Device list failed: ${describeApiError(deviceInfo.error)}`));
+    }
+    if (!deviceInfo.data || !Array.isArray(deviceInfo.data.listDevices)) {
+      return Promise.reject(
+        new Error(
+          `Device list response had an unexpected shape: ${JSON.stringify(deviceInfo).slice(0, 400)}`
+        )
+      );
+    }
 
     // If no MAC addresses specified, subscribe to ALL devices
     const subscribeToAll = !macAddresses || macAddresses.length === 0;
@@ -348,7 +390,7 @@ class CieloAPIConnection {
     // Only fall through to a paid captcha solve when that is unavailable or
     // rejected - reconnects are by far the most common path through here, and
     // paying for one on every dropped socket is what drained real balances.
-    if (this.#refreshToken) {
+    if (this.#refreshToken && REFRESH_TOKEN_LOGIN_ENABLED) {
       try {
         this.#log.info('Reconnecting with stored refresh token (no captcha needed)...');
         this.#agent = agent;
@@ -709,10 +751,17 @@ class CieloAPIConnection {
       },
     };
     const devicesData = await fetch(deviceInfoUrl, deviceInfoPayload)
-      .then((response) => response.json())
-      .then((responseJSON) => {
-        // console.log("devicesResponse... ", responseJSON.data.listDevices);
-        return responseJSON;
+      .then(async (response) => {
+        const body = await response.json();
+        // Keep the HTTP status with the payload. Without it, an API-level
+        // error object reaches the caller with no indication of whether it
+        // was an auth failure, a bad key, or a schema change.
+        if (!response.ok) {
+          this.#log.error(
+            `Device list request failed (HTTP ${response.status}): ${JSON.stringify(body)}`
+          );
+        }
+        return body;
       })
       .catch((error) => {
         this.#log.error("Failed to fetch device list:", error.message || error);
