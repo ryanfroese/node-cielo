@@ -738,7 +738,17 @@ class CieloAPIConnection {
       .then((responseJSON) => {
         // Check for successful response
         if (responseJSON.status !== 200 || !responseJSON.data || !responseJSON.data.user) {
-          throw new Error(`Login failed: ${responseJSON.message || 'Unknown error'}`);
+          // The API reports failures as {error: {code, message}}; reading only
+          // `message` rendered every login failure as "Unknown error" and hid
+          // the cause - a wrong password looked identical to an outage.
+          const detail = describeApiError(responseJSON.error || responseJSON.message);
+          // Deliberately NOT marked permanent. The API answers both a wrong
+          // password and an expired or rejected captcha token with the same
+          // `403 forbidden`, so treating 403 as permanent would let a single
+          // stale captcha stop the plugin for good. Retrying under the
+          // existing backoff is the safer failure mode; the message now says
+          // enough for an operator to tell the two apart.
+          throw new Error(`Login failed: ${detail}`);
         }
 
         const initialLoginData = responseJSON.data.user;

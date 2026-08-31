@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 See `API_STATUS.md` for the current state of the Cielo API, including which
 endpoints work, which are misleading, and how the findings were verified.
 
+## [2.2.1] - 2026-08-31
+
+### Fixed
+
+- Login failures were reported as `Login failed: Unknown error`. The API returns
+  `{"error": {"code", "message"}}`, but only the top-level `message` was read, so
+  a wrong password was indistinguishable from an outage. The real code and
+  message are now shown, e.g. `Login failed: 403: forbidden`.
+
+  Note that a rejected captcha and a wrong password both return `403 forbidden`,
+  so a login failure is deliberately *not* treated as permanent - stopping on
+  one would let a single stale captcha disable the plugin. Retries continue
+  under the existing backoff.
+
 ## [2.2.0] - 2026-08-31
 
 **Upgrade required.** Every earlier version is unable to list devices or stay
