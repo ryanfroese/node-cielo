@@ -7,13 +7,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is a NodeJS library that provides an interface to the SmartCielo API for controlling AC equipment (specifically Cielo thermostats) over the internet. It uses WebSockets for real-time bidirectional communication with the API.
 
 **Requirements:**
-- Node.js: Version 18.0.0 or higher (tested with Node.js 22)
+- Node.js: Version 18.0.0 or higher (tested with Node.js 20 and 22)
+
+**Note on naming:** this repository is `node-cielo`, but the npm package it
+publishes is **`node-smartcielo-ws`**. The Homebridge plugin depends on the npm
+name.
 
 ## Commands
 
-### Installation
+### Installation and tests
 ```bash
 npm install
+npm test        # regression tests for the captcha-spend defects
 ```
 
 ### Running the Demo
@@ -57,13 +62,18 @@ Options:
 5. `subscribeToHVACs()` is called with an array of MAC addresses
 6. `#getDeviceInfo()` fetches all devices for the account using new API key
 7. CieloHVAC objects are created for each matching MAC address
-8. `#connect()` establishes WebSocket connection with **Origin header** to `wss://apiwss.smartcielo.com/websocket/`
+8. `#connect()` establishes WebSocket connection with **Origin header** to `wss://wss.smartcielo.com/websocket/`
 
 **CRITICAL:** Captcha tokens are REQUIRED for authentication and expire within minutes. For Apple Home integration, tokens must be refreshed for each new connection.
 
 ### WebSocket Communication (v2.0+)
 
 **CRITICAL:** WebSocket connections MUST include `Origin: https://home.cielowigle.com` header or server returns 500 error.
+
+**Error reporting is single-shot.** A failing socket emits BOTH `error` and
+`close`. Both route through one `createSingleShotNotifier`, so the consumer is
+told exactly once. Reporting both made consumers schedule two reconnects - and
+buy two captcha solves - for one dropped connection (issue #10).
 
 The WebSocket connection handles messages identified by `message_type` field:
 - `"StateUpdate"`: Unified message type for both command state changes AND temperature updates
@@ -82,8 +92,8 @@ Commands are sent via WebSocket using JSON payloads built by `#buildCommandPaylo
 
 The `deviceTypeVersion` field (e.g., "BI01", "BI02") is critical for API compatibility:
 - Retrieved from device info during subscription
-- Must start with "BI" prefix (validated in CieloHVAC constructor at `Cielo.js:530-535`)
-- Defaults to "BI01" if invalid or missing
+- Must start with "BI" or "BP" (validated in the CieloHVAC constructor)
+- Defaults to "BP01" if invalid or missing
 - Passed to API in all command payloads
 - Recent fix (PR #1) ensured this field is properly passed through to API
 
@@ -91,8 +101,15 @@ The `deviceTypeVersion` field (e.g., "BI01", "BI02") is critical for API compati
 
 - Login: `https://api.smartcielo.com/auth/login` (CHANGED from `/web/login`)
 - Device list: `https://api.smartcielo.com/web/devices?limit=420` (unchanged)
-- Token refresh (currently unused): `https://api.smartcielo.com/web/token/refresh` (unchanged)
-- WebSocket: `wss://apiwss.smartcielo.com/websocket/?sessionId={sessionId}&token={accessToken}`
+- Token refresh: `https://api.smartcielo.com/web/token/refresh` (unchanged). Used
+  on reconnect to avoid paying for a captcha - see Captcha Cost Control below.
+- WebSocket: `wss://wss.smartcielo.com/websocket/?sessionId={sessionId}&token={accessToken}`
+
+  **CRITICAL:** the host is `wss.smartcielo.com`. `apiwss.smartcielo.com` is a
+  different subdomain, is not an authorized API Gateway endpoint, and answers
+  every upgrade with 403 Forbidden. Because login succeeds first, pointing at it
+  means paying for a captcha and *then* failing - which is what produced the
+  reconnect loop in issue #12. Do not "fix" this back.
 
 All REST endpoints require:
 - `x-api-key` header with value `XiZ0PkwbNlQmu3Zrt7XV3EHBj1b1bHU9k02MSJW2` (CHANGED from old key)
@@ -110,6 +127,36 @@ WebSocket connection requires:
 - `index.js`: Simple module export of Cielo.js
 - `demo.js`: Command-line demo showing connection, subscription, and HVAC control
 - Main exports: `CieloAPIConnection` and `CieloHVAC` classes
+
+### Captcha Cost Control
+
+Captcha solves cost money (~$0.003 each via 2Captcha), and every historical
+cost blow-up came from an unattended retry loop. Three mechanisms keep it down:
+
+1. **Refresh token first.** `establishConnectionWithAutoSolve()` spends a stored
+   refresh token when it has one and only falls back to a paid solve when that
+   is missing or rejected. Reconnects are the common path, so this is where
+   nearly all the savings are.
+2. **Refresh tokens are discarded when they stop working.** If a socket
+   authenticated by refresh never opens, the refresh token is dropped so the
+   next attempt does a full login instead of retrying free-but-doomed forever.
+3. **Permanent errors are tagged.** `ERROR_ZERO_BALANCE`, a wrong or banned key,
+   and similar raise `PermanentCaptchaError` (`permanent === true`). Callers
+   must stop on these rather than back off - retrying is exactly what re-drains
+   an account once it is topped up.
+
+### Logging
+
+Output goes through an injectable logger. Call `setLogger(log)` with a
+Homebridge-style logger (`debug`/`info`/`warn`/`error`) to attribute output to
+the host and honour its log level. Verbose per-message tracing is opt-in via
+`CIELO_DEBUG=1`.
+
+This used to be an unconditional `appendFileSync` of every WebSocket frame into
+`./cielo-debug.log`. On a real Homebridge host that file passed 10MB and
+silently broke nightly UI backups. Do not reintroduce unbounded file logging.
+Note also that the token-refresh response body contains both the access and
+refresh tokens - never log it verbatim.
 
 ### Debug Mode
 
@@ -161,7 +208,17 @@ When integrating with Apple HomeKit:
 
 ### Testing
 
-Test script with manual captcha token:
+```bash
+npm test
+```
+
+`tests/captcha-spend.test.js` pins the defects that cost real money: the
+WebSocket host, URL-encoding of the session/token, the single-report guarantee,
+absence of unbounded file tracing, and permanent-vs-transient captcha error
+classification. These assertions were verified by mutation - reintroducing the
+bad host or the double-report makes them fail.
+
+Manual end-to-end check against the live API (needs a captcha token):
 ```bash
 node test-with-token.js "<captcha-token>"
 ```
