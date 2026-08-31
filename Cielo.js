@@ -13,8 +13,13 @@ const DEFAULT_POWER = "off";
 const DEFAULT_MODE = "auto";
 const DEFAULT_FAN = "auto";
 const DEFAULT_TEMPERATURE = 75;
+// Login and data routes sit behind different API keys and are not
+// interchangeable: the login key is 403'd on data routes, and vice versa.
 const API_KEY = "XiZ0PkwbNlQmu3Zrt7XV3EHBj1b1bHU9k02MSJW2";
+const DATA_API_KEY = "7xTAU4y4B34u8DjMsODlEyprRRQEsbJ3IB7vZie4";
 const APP_VERSION = "1.4.4";
+// Version reported when identifying as the iOS app (see #getAccessTokenAndSessionId).
+const IOS_APP_VERSION = "5.0.4";
 
 // Verbose per-message tracing is opt-in. It used to be unconditional, and
 // wrote every WebSocket frame to ./cielo-debug.log with appendFileSync - an
@@ -22,19 +27,13 @@ const APP_VERSION = "1.4.4";
 // Homebridge host that file grew past 10MB and broke nightly UI backups.
 const DEBUG_ENABLED = process.env.CIELO_DEBUG === "1";
 
-// Reusing a refresh token would avoid paying for a captcha on every reconnect,
-// which is by far the biggest available saving. It is disabled because the only
-// known refresh endpoint, /web/token/refresh, sits behind AWS IAM (SigV4) auth:
-// it answers a bearer-token request with
-//   "Authorization header requires 'Credential' parameter ... 'Signature' ...
-//    'SignedHeaders' ... 'X-Amz-Date'"
-// which we cannot produce without AWS credentials. It appears to be a leftover
-// from the pre-v2.0 API. Attempting it just adds a failed round-trip to every
-// reconnect before falling back to a captcha anyway.
-//
-// Re-enable by setting CIELO_ENABLE_REFRESH_LOGIN=1 once a working refresh
-// endpoint is captured from the web app; the fallback path is already correct.
-const REFRESH_TOKEN_LOGIN_ENABLED = process.env.CIELO_ENABLE_REFRESH_LOGIN === "1";
+// Reconnect spends the stored refresh token before paying for a captcha.
+// This is the difference between one solve per install and one per reconnect.
+// It was disabled in 2.1.1 because the endpoint appeared broken; that was the
+// WEB session type being broken, not the endpoint. Under an IOS login it works
+// and the token can be rotated indefinitely.
+const REFRESH_TOKEN_LOGIN_ENABLED =
+  process.env.CIELO_ENABLE_REFRESH_LOGIN !== "0";
 
 /**
  * Wraps a handler so it runs at most once, and always runs the supplied
@@ -126,6 +125,14 @@ class CieloAPIConnection {
   // True when the current credentials came from a refresh-token exchange
   // rather than a full captcha login (see establishConnectionWithAutoSolve).
   #authenticatedViaRefresh = false;
+
+  // Per-instance device identity sent at login. Randomised so this client
+  // occupies its own session slot rather than colliding with the user's
+  // browser or phone, both of which would otherwise share the literal "WEB".
+  #deviceIdentity = {
+    mobileDeviceId: crypto.randomUUID().toUpperCase(),
+    deviceTokenId: crypto.randomBytes(32).toString("hex"),
+  };
 
   /**
    * Creates an API connection object that will use the provided callbacks
@@ -263,9 +270,13 @@ class CieloAPIConnection {
 
     await this.#getAccessTokenAndSessionId(username, password, ip, captchaToken).then(
       (data) => {
-        // console.log(data);
-        // Save the results
-        this.#sessionID = data.sessionId;
+        // The iOS login response carries no sessionId, but the WebSocket
+        // rejects an omitted or empty one with a 502. The value is not
+        // validated server-side - any non-empty string is accepted (verified
+        // against several formats) - so generate one, mirroring the web UI's
+        // own "<client>-<timestamp>" shape.
+        this.#sessionID =
+          data.sessionId || `ios-${Date.now()}${Math.floor(Math.random() * 1e6)}`;
         this.#userID = data.userId;
         this.#accessToken = data.accessToken;
         this.#refreshToken = data.refreshToken;
@@ -313,19 +324,28 @@ class CieloAPIConnection {
       return Promise.reject(new Error('No refresh token available. Must login first.'));
     }
 
+    // The working contract, captured from the live web app and verified
+    // against the API. Every part of it matters:
+    //   - POST, not GET. GET on this path is IAM-authed and answers any
+    //     bearer-style request with a SigV4 complaint.
+    //   - the "/1" path segment. /web/token/refresh without it is also
+    //     IAM-authed.
+    //   - DATA_API_KEY, not the login key. The login key is 403'd here.
+    //   - the refresh token in the body; the access token in Authorization.
     const refreshUrl = new URL(
-      `${API_HTTP_PROTOCOL}${API_HOST}/web/token/refresh?refreshToken=${tokenToUse}`
+      `${API_HTTP_PROTOCOL}${API_HOST}/web/token/refresh/1`
     );
 
     const refreshPayload = {
       agent: this.#agent,
       headers: {
-        accept: "application/json, text/plain, */*",
-        authorization: tokenToUse,
-        "content-type": "application/json; charset=utf-8",
-        "x-api-key": API_KEY,
+        accept: "application/json",
+        Authorization: this.#accessToken,
+        "content-type": "application/json",
+        "x-api-key": DATA_API_KEY,
       },
-      method: "GET",
+      method: "POST",
+      body: JSON.stringify({ refreshToken: tokenToUse, locale: "en" }),
     };
 
     return fetch(refreshUrl, refreshPayload)
@@ -336,10 +356,11 @@ class CieloAPIConnection {
       .then(({status, body}) => {
         // NB: the body carries accessToken/refreshToken - never log it verbatim.
         this.#log.debug('Refresh response ok:', Boolean(body.data));
-        if (body.data) {
-          // Update stored tokens
+        if (body.data && body.data.accessToken) {
+          // The server rotates the refresh token on every call; keep the new
+          // one or the next refresh will fail.
           this.#accessToken = body.data.accessToken;
-          this.#refreshToken = body.data.refreshToken;
+          this.#refreshToken = body.data.refreshToken || this.#refreshToken;
           this.#expiresIn = body.data.expiresIn;
           return Promise.resolve();
         } else {
@@ -659,17 +680,31 @@ class CieloAPIConnection {
     // Hash the password to match web UI behavior
     const hashedPassword = this.#hashPassword(password);
 
+    // Identify as the iOS app, NOT the web UI.
+    //
+    // The WEB session type is broken server-side: its tokens are rejected by
+    // /web/devices and by the refresh endpoint, and Cielo's own web app
+    // consequently cannot hold a session (it logs in, refreshes, gets 401 and
+    // signs itself out - reproducible in a clean browser profile).
+    //
+    // The IOS session type works completely: the device list returns, and
+    // refresh returns new tokens indefinitely. That last part is what keeps
+    // captcha spend to a single solve rather than one per reconnect.
+    //
+    // Each install gets a stable random device identity rather than the
+    // literal "WEB", so it occupies its own session slot instead of competing
+    // with the user's browser or phone.
     const requestBody = {
       user: {
         userId: username,
         password: hashedPassword,
-        mobileDeviceId: "WEB",
-        deviceTokenId: "WEB",
-        appType: "WEB",
-        appVersion: APP_VERSION,
+        mobileDeviceId: this.#deviceIdentity.mobileDeviceId,
+        deviceTokenId: this.#deviceIdentity.deviceTokenId,
+        appType: "IOS",
+        appVersion: IOS_APP_VERSION,
         timeZone: "America/Los_Angeles",
-        mobileDeviceName: "chrome",
-        deviceType: "WEB",
+        mobileDeviceName: "iPhone",
+        deviceType: "IOS",
         ipAddress: ip || "0.0.0.0",
         isSmartHVAC: 0,
         locale: "en",
@@ -747,7 +782,7 @@ class CieloAPIConnection {
         "sec-fetch-site": "cross-site",
         "user-agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "x-api-key": "7xTAU4y4B34u8DjMsODlEyprRRQEsbJ3IB7vZie4",
+        "x-api-key": DATA_API_KEY,
       },
     };
     const devicesData = await fetch(deviceInfoUrl, deviceInfoPayload)

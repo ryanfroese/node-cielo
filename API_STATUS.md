@@ -8,17 +8,25 @@ Several "obvious" fixes here are wrong, and the notes say why.
 
 ## Summary
 
-| Capability | State | Notes |
-|---|---|---|
-| Login (`POST /auth/login`) | **works** | captcha required; field is `captchaToken` (camelCase) |
-| Access token lifetime | **3600s** | exactly one hour |
-| WebSocket | **works** | `wss://wss.smartcielo.com`, keepalive verified |
-| Device list (REST) | **broken** | every known route rejects a valid token |
-| Token refresh | **broken** | rejects a refresh token 5 seconds old |
+**Everything works - as long as you log in as `IOS`, not `WEB`.**
 
-The WebSocket path is healthy. The REST data path is not, and the failure is
-server-side: **Cielo's own web app cannot hold a session either**, reproduced in
-a clean incognito profile with no extensions.
+| Capability | as `WEB` | as `IOS` |
+|---|---|---|
+| Login (`POST /auth/login`) | works | works |
+| Device list (`/web/devices?limit=420`) | **rejected (498)** | **works** |
+| Token refresh (`/web/token/refresh/1`) | **rejected (401)** | **works, repeatable** |
+| WebSocket | works | works (needs a generated sessionId) |
+
+The `WEB` session type is broken server-side. Its tokens are refused by the
+data routes and by refresh, which is why Cielo's own web app cannot hold a
+session: it logs in, refreshes, gets 401 and signs itself out. Reproduced in a
+clean incognito profile with no extensions.
+
+This is **not** account-specific and not a block. The same account, credentials
+and IP succeed under `IOS` in the same minute.
+
+Verified end to end against the live API: four consecutive connections,
+**one captcha solve total**, all four devices discovered each time.
 
 ## What works
 
@@ -30,11 +38,16 @@ x-api-key: XiZ0PkwbNlQmu3Zrt7XV3EHBj1b1bHU9k02MSJW2
 content-type: application/json; charset=UTF-8
 origin: https://home.cielowigle.com
 
-{"user": {"userId": "...", "password": "<sha256 hex>", "mobileDeviceId": "WEB",
-          "deviceTokenId": "WEB", "appType": "WEB", "appVersion": "1.4.4",
-          "deviceType": "WEB", "ipAddress": "...", "isSmartHVAC": 0,
-          "locale": "en", ...},
+{"user": {"userId": "...", "password": "<sha256 hex>",
+          "mobileDeviceId": "<random uuid>", "deviceTokenId": "<random hex>",
+          "appType": "IOS", "appVersion": "5.0.4",
+          "mobileDeviceName": "iPhone", "deviceType": "IOS",
+          "ipAddress": "...", "isSmartHVAC": 0, "locale": "en", ...},
  "captchaToken": "<recaptcha v2 token>"}
+
+Use **`IOS`**, not `WEB`. Randomise the device identity so this client holds
+its own session slot instead of sharing the literal "WEB" with the user's
+browser and phone.
 ```
 
 The captcha field is **`captchaToken`**, camelCase. Issue #6 reported that it
@@ -43,7 +56,8 @@ live login with camelCase returns `status: 200 / SUCCESS`. The API no longer
 emits the `'captcha_token' is a required property` message that report quoted.
 
 Returns `data.user` with `accessToken`, `refreshToken`, `expiresIn` (an absolute
-unix timestamp, consistently `now + 3600`), `sessionId`, `userId`.
+unix timestamp, consistently `now + 3600`) and `userId`. Note there is **no
+`sessionId`** under an IOS login - see the WebSocket section.
 
 ### WebSocket
 
@@ -73,11 +87,11 @@ Note the socket does **not** care that the access token later expires. An open
 socket keeps working past the 1-hour mark, so the practical way to minimise
 captcha spend is to hold one socket open rather than to re-authenticate.
 
-## What is broken
+## The parts that mislead
 
 ### Token refresh
 
-The endpoint exists and its contract is known. Captured from the live web app:
+Captured from the live web app and verified:
 
 ```
 POST https://api.smartcielo.com/web/token/refresh/1
@@ -85,44 +99,46 @@ content-type, x-api-key, Authorization, Accept
 {"refreshToken": "...", "locale": "en"}
 ```
 
-It returns `401 invalid or expired token` for a refresh token **5 seconds old**.
-Tested seven variants immediately after a successful login: the exact web-app
-contract, both API keys, `Authorization` set to the access token and to the
-refresh token, with and without `locale`, `Bearer`-prefixed, and snake_case
-`refresh_token`. All 401.
+Every part of that contract matters:
 
-The production web app hits the same 401 and logs itself out, redirecting to
-`/auth/login?reason=tokenExpired`. Reproduced in clean incognito.
+- **POST**, not GET. `GET` on this path is IAM-authed and answers any
+  bearer-style request with a SigV4 complaint.
+- **the `/1` segment**. `/web/token/refresh` without it is also IAM-authed.
+- **the data key**, not the login key. The login key is `403`d here.
+- refresh token in the **body**, access token in **`Authorization`**.
 
-**Consequence: there is currently no way to reconnect without buying a
-captcha.** Refresh-based login is therefore disabled in `Cielo.js` behind
-`CIELO_ENABLE_REFRESH_LOGIN=1`. The fallback path is already correct, so if
-Cielo fixes this, setting that variable is all that is needed.
+The server **rotates the refresh token on every call** - keep the returned one
+or the next refresh fails.
 
-### Device list
+Under a `WEB` login this returns `401` even for a token 5 seconds old (tested
+across seven variants). Under an `IOS` login it succeeds and can be repeated
+indefinitely, which is what reduces captcha spend to a single solve per
+install rather than one per reconnect.
 
-`/web/devices?limit=420` — what this library used to call — **no longer exists**.
-It appears nowhere in the current web app bundle, and returns `498` for every
-combination of key, token format, and headers.
+### Device list (works under IOS)
 
-Deobfuscating the bundle gives the replacement:
-
-```js
-getDevicesUrl() { return config.baseUrl + '/web/device/1'; }
+```
+GET https://api.smartcielo.com/web/devices?limit=420
+x-api-key: 7xTAU4y4B34u8DjMsODlEyprRRQEsbJ3IB7vZie4   (data key, not the login key)
+authorization: <accessToken>
 ```
 
-But no request I can construct is accepted:
+Returns `data.listDevices` with everything the plugin needs: `macAddress`,
+`deviceName`, `applianceId`, `deviceTypeVersion`, `fwVersion`, `latestAction`
+and `latEnv`.
 
-| Route | Method | Result |
-|---|---|---|
-| `/web/device/1` | GET, POST, PATCH, DELETE | `403 Missing Authentication Token` (route absent) |
-| `/web/device/1` | PUT | `498` — route exists, token rejected |
-| `/web/device` | GET | `498` — route exists, token rejected |
-| `/web/device` | POST | `403 Missing Authentication Token` |
+This endpoint is **not** retired, despite appearing nowhere in the web bundle.
+It simply rejects `WEB` tokens with `498`. The bundle's `getDevicesUrl()`
+resolves to `/web/device/1`, which is what the current *web app* calls; that
+route is IAM-authed for every method we can send, so it is not usable here.
+`/web/devices` remains available to app clients.
 
-Every route that reaches the application rejects an access token that is
-minutes old — **the same token the WebSocket accepts**. So the token is
-genuinely valid; the REST authorizer disagrees.
+### WebSocket sessionId
+
+The IOS login response contains **no `sessionId`**, but the socket rejects an
+omitted or empty one with `502`. The value is not validated server-side -
+`chrome-<ts>`, `ios-<ts>`, a bare timestamp and the userId were all accepted -
+so the client generates one. Only emptiness is fatal.
 
 ### API keys
 

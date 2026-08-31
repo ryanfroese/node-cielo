@@ -186,6 +186,66 @@ function testTransientCaptchaErrorIsNotPermanent() {
   );
 }
 
+/*
+ * The WEB session type is broken server-side: its tokens are rejected by
+ * /web/devices and by refresh, so Cielo's own web app cannot hold a session.
+ * The IOS session type works. Logging in as WEB is what made this plugin
+ * unusable, so pin it.
+ */
+function testLoginIdentifiesAsIos() {
+  assert.ok(
+    /appType:\s*"IOS"/.test(source),
+    'login must send appType "IOS" - WEB tokens are rejected by the data routes'
+  );
+  assert.ok(
+    /deviceType:\s*"IOS"/.test(source),
+    'login must send deviceType "IOS"'
+  );
+  assert.ok(
+    !/appType:\s*"WEB"/.test(source),
+    'appType "WEB" must not come back; its tokens cannot fetch devices or refresh'
+  );
+}
+
+/*
+ * Every part of the refresh contract was established the hard way. A wrong
+ * method, path or key silently reverts to "refresh is broken", which costs a
+ * captcha per reconnect.
+ */
+function testRefreshContract() {
+  const fn = source.slice(source.indexOf('async refreshAccessToken'));
+  const body = fn.slice(0, fn.indexOf('\n  }'));
+  assert.ok(/\/web\/token\/refresh\/1/.test(body),
+    'refresh must POST to /web/token/refresh/1 - the path without /1 is IAM-authed');
+  assert.ok(/method:\s*"POST"/.test(body),
+    'refresh must use POST - GET on this path is IAM-authed and rejects bearer tokens');
+  assert.ok(/"x-api-key":\s*DATA_API_KEY/.test(body),
+    'refresh must use the data API key - the login key is 403d here');
+  assert.ok(/refreshToken:\s*tokenToUse/.test(body),
+    'the refresh token belongs in the body');
+  assert.ok(/body\.data\.refreshToken\s*\|\|/.test(body),
+    'the server rotates the refresh token; the new one must be kept or the next refresh fails');
+}
+
+/*
+ * The iOS login returns no sessionId, but the socket 502s without one. Any
+ * non-empty value is accepted, so we generate it.
+ */
+function testSessionIdIsGeneratedWhenAbsent() {
+  assert.ok(
+    /data\.sessionId\s*\|\|/.test(source),
+    'a sessionId must be generated when the login response omits one, or the WebSocket 502s'
+  );
+}
+
+function testRefreshIsEnabledByDefault() {
+  assert.ok(
+    /CIELO_ENABLE_REFRESH_LOGIN\s*!==\s*"0"/.test(source),
+    'refresh-first reconnect must be on by default - it is the difference between ' +
+    'one captcha per install and one per reconnect'
+  );
+}
+
 (async () => {
   console.log('captcha-spend regression tests\n');
   await check('WebSocket points at wss.smartcielo.com (issue #12)', testWebSocketHost);
@@ -195,6 +255,10 @@ function testTransientCaptchaErrorIsNotPermanent() {
   await check('notifier forwards the original error', testNotifierPassesThroughArguments);
   await check('ERROR_ZERO_BALANCE is permanent', testZeroBalanceIsPermanent);
   await check('unsolvable captcha stays retryable', testTransientCaptchaErrorIsNotPermanent);
+  await check('login identifies as iOS, not WEB', testLoginIdentifiesAsIos);
+  await check('refresh uses the verified contract', testRefreshContract);
+  await check('sessionId generated when login omits it', testSessionIdIsGeneratedWhenAbsent);
+  await check('refresh-first reconnect on by default', testRefreshIsEnabledByDefault);
 
   if (failures > 0) {
     console.error(`\n${failures} test(s) failed`);
