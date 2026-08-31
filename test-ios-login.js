@@ -5,9 +5,21 @@
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 
-const USERNAME = 'ryan.c.froese@gmail.com';
-const PASSWORD = 'sBqs4jNR2FYmz@R';
-const IP = '73.162.98.163';
+
+require('dotenv').config();
+
+// Credentials come from the environment (see .env.example). They were
+// previously hardcoded here and leaked to a public repo and to every
+// published npm tarball; never inline them again.
+const USERNAME = process.env.CIELO_USERNAME;
+const PASSWORD = process.env.CIELO_PASSWORD;
+const IP = process.env.CIELO_IP || '0.0.0.0';
+const TWOCAPTCHA_API_KEY = process.env.TWOCAPTCHA_API_KEY;
+
+if (!USERNAME || !PASSWORD) {
+  console.error('Set CIELO_USERNAME and CIELO_PASSWORD in .env (copy .env.example).');
+  process.exit(1);
+}
 
 async function testIOSLogin() {
   const hashedPassword = crypto.createHash('sha256').update(PASSWORD).digest('hex');

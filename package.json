@@ -11,7 +11,7 @@
     "ws": "^7.2.5"
   },
   "scripts": {
-    "test": "node tests/captcha-spend.test.js"
+    "test": "node tests/no-secrets.test.js && node tests/captcha-spend.test.js"
   },
   "repository": {
     "type": "git",

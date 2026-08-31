@@ -1,7 +1,11 @@
 # Traffic capture analysis (development only)
 traffic-captures/
 
-# Development-only test files (keep demo.js and test-interactive.js)
+# Development-only test files. NOTHING that reads credentials ships: a
+# hardcoded password in test-interactive.js reached every published tarball.
+test-*.js
+tests/
+demo.js
 test-auto-captcha.js
 test-with-token.js
 test-ios-login.js

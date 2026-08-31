@@ -63,7 +63,7 @@ You now have a **complete automated captcha solving and connection management sy
 
 ```bash
 # Your 2Captcha API key
-export TWOCAPTCHA_API_KEY="aefc12e515a4d9b8f235c2099b678f10"
+export TWOCAPTCHA_API_KEY="YOUR_2CAPTCHA_API_KEY"
 
 # Optional: Override siteKey (already hardcoded to working value)
 export CIELO_RECAPTCHA_SITEKEY="6Lewqu8nAAAAAOudyOyScwjI4dFukcDvJZprnZB6"
@@ -308,7 +308,7 @@ method: 'userrecaptcha'
 
 ```bash
 # Required
-export TWOCAPTCHA_API_KEY="aefc12e515a4d9b8f235c2099b678f10"
+export TWOCAPTCHA_API_KEY="YOUR_2CAPTCHA_API_KEY"
 
 # Optional (has working default)
 export CIELO_RECAPTCHA_SITEKEY="6Lewqu8nAAAAAOudyOyScwjI4dFukcDvJZprnZB6"
