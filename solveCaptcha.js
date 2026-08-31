@@ -22,6 +22,25 @@
 
 const fetch = require('node-fetch');
 
+// Output goes through a caller-supplied logger when there is one, so a
+// Homebridge host can attribute and level-filter it instead of having raw
+// console output land in the shared log.
+let log = {
+  info: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args),
+  error: (...args) => console.error(...args),
+};
+
+function setLogger(logger) {
+  if (logger) {
+    log = {
+      info: (logger.info || log.info).bind(logger),
+      warn: (logger.warn || log.warn).bind(logger),
+      error: (logger.error || log.error).bind(logger),
+    };
+  }
+}
+
 /**
  * Solve reCAPTCHA v2 captcha using 2Captcha service
  *
@@ -54,7 +73,7 @@ async function fetchWithRetry(url, maxRetries = 3, initialDelay = 2000) {
 
       if (isNetworkError && attempt < maxRetries) {
         const delay = initialDelay * Math.pow(2, attempt - 1); // Exponential backoff
-        console.log(`[2Captcha] Network error (${error.message.split(',')[0]}) - retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        log.warn(`[2Captcha] Network error (${error.message.split(',')[0]}) - retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
@@ -65,6 +84,41 @@ async function fetchWithRetry(url, maxRetries = 3, initialDelay = 2000) {
   }
 
   throw lastError;
+}
+
+/**
+ * 2Captcha failures that will never succeed on retry, no matter how long we
+ * wait: the account is out of money, the key is wrong, or the key is blocked.
+ * Retrying these just spins - and once a balance is topped back up, an
+ * unattended retry loop is exactly what drains it again. Callers should treat
+ * a PermanentCaptchaError as "stop and tell the operator", not "back off".
+ */
+const PERMANENT_2CAPTCHA_ERRORS = [
+  'ERROR_ZERO_BALANCE',
+  'ERROR_WRONG_USER_KEY',
+  'ERROR_KEY_DOES_NOT_EXIST',
+  'ERROR_IP_NOT_ALLOWED',
+  'IP_BANNED',
+  'ERROR_BAD_DUPLICATES',
+];
+
+class PermanentCaptchaError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PermanentCaptchaError';
+    this.permanent = true;
+  }
+}
+
+function raise2CaptchaError(code, phase) {
+  const detail = `2Captcha ${phase} failed: ${code}`;
+  if (PERMANENT_2CAPTCHA_ERRORS.includes(code)) {
+    const hint = code === 'ERROR_ZERO_BALANCE'
+      ? ' - your 2Captcha account is out of funds. Top it up at https://2captcha.com/ and restart the plugin.'
+      : ' - check the twocaptcha_api_key in your plugin configuration.';
+    throw new PermanentCaptchaError(detail + hint);
+  }
+  throw new Error(detail);
 }
 
 async function solve2Captcha(apiKey, siteKey, options = {}) {
@@ -80,7 +134,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     throw new Error('reCAPTCHA siteKey is required. See instructions in solveCaptcha.js');
   }
 
-  console.log('[2Captcha] Submitting captcha to 2Captcha service...');
+  log.info('[2Captcha] Submitting captcha to 2Captcha service...');
 
   // Submit captcha to 2Captcha using reCAPTCHA v2 method with retry
   const submitUrl = `https://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${siteKey}&pageurl=${encodeURIComponent(pageUrl)}&json=1`;
@@ -88,12 +142,12 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
   const submitResponse = await fetchWithRetry(submitUrl);
 
   if (submitResponse.status !== 1) {
-    throw new Error(`2Captcha submission failed: ${submitResponse.request}`);
+    raise2CaptchaError(submitResponse.request, 'submission');
   }
 
   const captchaId = submitResponse.request;
-  console.log(`[2Captcha] Captcha submitted. ID: ${captchaId}`);
-  console.log('[2Captcha] Waiting for solution (this usually takes 10-30 seconds)...');
+  log.info(`[2Captcha] Captcha submitted. ID: ${captchaId}`);
+  log.info('[2Captcha] Waiting for solution (this usually takes 10-30 seconds)...');
 
   // Wait before first check (captchas typically take 10-30 seconds)
   await new Promise(resolve => setTimeout(resolve, 10000));
@@ -109,7 +163,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     const result = await fetchWithRetry(resultUrl);
 
     if (result.status === 1) {
-      console.log(`[2Captcha] ✅ Captcha solved! (took ${attempts} attempts, ${Math.round((Date.now() - startTime) / 1000)}s)`);
+      log.info(`[2Captcha] Captcha solved! (took ${attempts} attempts, ${Math.round((Date.now() - startTime) / 1000)}s)`);
       return result.request; // This is the captcha token
     }
 
@@ -120,7 +174,7 @@ async function solve2Captcha(apiKey, siteKey, options = {}) {
     }
 
     // Any other response is an error
-    throw new Error(`2Captcha error: ${result.request}`);
+    raise2CaptchaError(result.request, 'solve');
   }
 
   throw new Error(`2Captcha timeout after ${timeout}ms`);
@@ -187,12 +241,14 @@ async function solveCieloCaptcha(options = {}) {
     );
   }
 
-  console.log(`[2Captcha] Using siteKey: ${siteKey}`);
+  log.info(`[2Captcha] Using siteKey: ${siteKey}`);
 
   return solve2Captcha(apiKey, siteKey, options);
 }
 
 module.exports = {
+  PermanentCaptchaError,
+  setLogger,
   solve2Captcha,
   solveCieloCaptcha,
   useManualToken,

@@ -1,6 +1,6 @@
 {
   "name": "node-smartcielo-ws",
-  "version": "2.0.7",
+  "version": "2.1.0",
   "description": "NodeJS interface for the SmartCielo remote AC control API",
   "dependencies": {
     "command-line-args": "^5.1.1",
@@ -11,7 +11,7 @@
     "ws": "^7.2.5"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node tests/captcha-spend.test.js"
   },
   "repository": {
     "type": "git",

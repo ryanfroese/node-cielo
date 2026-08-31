@@ -6,6 +6,8 @@ const crypto = require("crypto");
 // Constants
 const API_HOST = "api.smartcielo.com";
 const API_HTTP_PROTOCOL = "https://";
+const WS_URL = "wss://wss.smartcielo.com/websocket/";
+const WEB_ORIGIN = "https://home.cielowigle.com";
 const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes - refresh before 15min disconnect
 const DEFAULT_POWER = "off";
 const DEFAULT_MODE = "auto";
@@ -13,6 +15,53 @@ const DEFAULT_FAN = "auto";
 const DEFAULT_TEMPERATURE = 75;
 const API_KEY = "XiZ0PkwbNlQmu3Zrt7XV3EHBj1b1bHU9k02MSJW2";
 const APP_VERSION = "1.4.4";
+
+// Verbose per-message tracing is opt-in. It used to be unconditional, and
+// wrote every WebSocket frame to ./cielo-debug.log with appendFileSync - an
+// unbounded, synchronous write into the process working directory. On a
+// Homebridge host that file grew past 10MB and broke nightly UI backups.
+const DEBUG_ENABLED = process.env.CIELO_DEBUG === "1";
+
+/**
+ * Wraps a handler so it runs at most once, and always runs the supplied
+ * cleanup first.
+ *
+ * A failing WebSocket emits BOTH "error" and "close". Reporting each of them
+ * to the consumer made it schedule two reconnects per failure, and every
+ * reconnect buys a fresh captcha solve - so a single dropped connection was
+ * billed twice (see issue #10). Both handlers route through one of these.
+ *
+ * @param {function} cleanup Runs on every invocation, before any dispatch
+ * @param {function} handler Runs only on the first invocation
+ * @returns {function} The single-shot notifier
+ */
+function createSingleShotNotifier(cleanup, handler) {
+  let fired = false;
+  return (...args) => {
+    cleanup();
+    if (fired) {
+      return false;
+    }
+    fired = true;
+    handler(...args);
+    return true;
+  };
+}
+
+/**
+ * Default logger. Consumers (e.g. Homebridge) should call setLogger() to route
+ * output through their own logging system instead of stdout.
+ */
+const defaultLogger = {
+  debug: (...args) => {
+    if (DEBUG_ENABLED) {
+      console.log(...args);
+    }
+  },
+  info: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args),
+  error: (...args) => console.error(...args),
+};
 
 // Exports
 class CieloAPIConnection {
@@ -45,6 +94,13 @@ class CieloAPIConnection {
   #temperatureCallback;
   #errorCallback;
 
+  // Logger (override with setLogger to route through a host logging system)
+  #log = defaultLogger;
+
+  // True when the current credentials came from a refresh-token exchange
+  // rather than a full captcha login (see establishConnectionWithAutoSolve).
+  #authenticatedViaRefresh = false;
+
   /**
    * Creates an API connection object that will use the provided callbacks
    * once created.
@@ -60,6 +116,33 @@ class CieloAPIConnection {
     this.#commandCallback = commandCallback;
     this.#temperatureCallback = temperatureCallback;
     this.#errorCallback = errorCallback;
+  }
+
+  /**
+   * Route this connection's output through a host-provided logger.
+   *
+   * Homebridge plugins should call this with their platform logger so output
+   * is attributed to the plugin and honours the host's log level, rather than
+   * being written straight to stdout.
+   *
+   * @param {{debug: function, info: function, warn: function, error: function}} logger
+   */
+  setLogger(logger) {
+    if (logger) {
+      this.#log = {
+        debug: (logger.debug || defaultLogger.debug).bind(logger),
+        info: (logger.info || defaultLogger.info).bind(logger),
+        warn: (logger.warn || defaultLogger.warn).bind(logger),
+        error: (logger.error || defaultLogger.error).bind(logger),
+      };
+      // The captcha solver is a separate module with its own output; route it
+      // through the same logger so nothing bypasses the host's log.
+      try {
+        require('./solveCaptcha.js').setLogger(logger);
+      } catch (err) {
+        this.#log.debug('Could not configure captcha solver logger:', err.message);
+      }
+    }
   }
 
   // Connection methods
@@ -91,15 +174,13 @@ class CieloAPIConnection {
     // Extract the relevant HVACs from the results
     for (const device of deviceInfo.data.listDevices) {
       if (subscribeToAll || macAddresses.includes(device.macAddress)) {
-        // Debug log device info
-        const fs = require('fs');
-        fs.appendFileSync('cielo-debug.log', `\n[${new Date().toISOString()}] SUBSCRIBING TO DEVICE:\n${JSON.stringify({
+        this.#log.debug("Subscribing to device:", JSON.stringify({
           macAddress: device.macAddress,
           deviceName: device.deviceName,
           applianceId: device.applianceId,
           fwVersion: device.fwVersion,
           deviceTypeVersion: device.deviceTypeVersion
-        }, null, 2)}\n`);
+        }));
 
         let hvac = new CieloHVAC(
           device.macAddress,
@@ -207,11 +288,12 @@ class CieloAPIConnection {
 
     return fetch(refreshUrl, refreshPayload)
       .then((response) => {
-        console.log('Refresh response status:', response.status);
+        this.#log.debug('Refresh response status:', response.status);
         return response.json().then(json => ({ status: response.status, body: json }));
       })
       .then(({status, body}) => {
-        console.log('Refresh response body:', JSON.stringify(body, null, 2));
+        // NB: the body carries accessToken/refreshToken - never log it verbatim.
+        this.#log.debug('Refresh response ok:', Boolean(body.data));
         if (body.data) {
           // Update stored tokens
           this.#accessToken = body.data.accessToken;
@@ -262,17 +344,44 @@ class CieloAPIConnection {
    * );
    */
   async establishConnectionWithAutoSolve(username, password, ip, agent, captchaOptions = {}) {
+    // A refresh token, when we hold one, buys a new access token for free.
+    // Only fall through to a paid captcha solve when that is unavailable or
+    // rejected - reconnects are by far the most common path through here, and
+    // paying for one on every dropped socket is what drained real balances.
+    if (this.#refreshToken) {
+      try {
+        this.#log.info('Reconnecting with stored refresh token (no captcha needed)...');
+        this.#agent = agent;
+        await this.refreshAccessToken();
+        this.#log.info('Access token refreshed - skipped captcha solve.');
+        // Remember how we authenticated. A refreshed access token reuses the
+        // existing sessionID, and the server may have expired that session
+        // even though the refresh itself succeeded. If the socket never opens
+        // we discard the refresh token so the next attempt pays for a full
+        // login rather than looping for free but forever.
+        this.#authenticatedViaRefresh = true;
+        return;
+      } catch (refreshError) {
+        this.#log.warn(
+          'Refresh token rejected, falling back to captcha login:',
+          refreshError.message
+        );
+        this.#refreshToken = undefined;
+      }
+    }
+
     // Lazy-load the captcha solver to avoid requiring it if not used
     const { solveCieloCaptcha } = require('./solveCaptcha.js');
 
-    console.log('🔓 Solving captcha automatically...');
+    this.#log.info('Solving captcha automatically...');
 
     // Solve the captcha using 2Captcha
     const captchaToken = await solveCieloCaptcha(captchaOptions);
 
-    console.log('✅ Captcha solved! Logging in...');
+    this.#log.info('Captcha solved. Logging in...');
 
     // Use the regular establishConnection with the solved token
+    this.#authenticatedViaRefresh = false;
     return this.establishConnection(username, password, ip, agent, captchaToken);
   }
 
@@ -306,18 +415,22 @@ class CieloAPIConnection {
    */
   async #connect() {
     // Establish the WebSockets connection
+    // NOTE: the host is `wss.smartcielo.com`, NOT `apiwss.smartcielo.com`.
+    // The latter is a different subdomain that is not an authorized API
+    // Gateway endpoint and answers every upgrade request with 403 Forbidden,
+    // which used to send the whole client into a reconnect loop (see issue #12).
     const connectUrl = new URL(
-      "wss://apiwss.smartcielo.com/websocket/" +
+      WS_URL +
         "?sessionId=" +
-        this.#sessionID +
+        encodeURIComponent(this.#sessionID) +
         "&token=" +
-        this.#accessToken
+        encodeURIComponent(this.#accessToken)
     );
 
     // Match the web UI's WebSocket connection headers exactly
     const wsOptions = {
       headers: {
-        'Origin': 'https://home.cielowigle.com',
+        'Origin': WEB_ORIGIN,
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
       }
     };
@@ -328,20 +441,54 @@ class CieloAPIConnection {
     let pingInterval;
     let pongTimeout;
 
+    // A failing socket emits BOTH "error" and "close". Reporting each of them
+    // to the error callback made the consumer schedule two reconnects per
+    // failure, and every reconnect buys a fresh captcha solve - so a single
+    // dropped connection was billed twice. Report at most once per socket.
+    let everOpened = false;
+
+    const clearTimers = () => {
+      if (pingInterval) {
+        clearInterval(pingInterval);
+        pingInterval = null;
+      }
+      if (pongTimeout) {
+        clearTimeout(pongTimeout);
+        pongTimeout = null;
+      }
+    };
+
+    const notifyOnce = createSingleShotNotifier(clearTimers, (error) => {
+      // A socket that never opened after a refresh-token login usually means
+      // the reused session is no longer valid. Drop the refresh token so the
+      // next attempt performs a full captcha login instead of retrying a
+      // free-but-doomed path forever.
+      if (!everOpened && this.#authenticatedViaRefresh) {
+        this.#log.warn(
+          'Connection failed after a refresh-token login - discarding refresh token so the next attempt does a full login.'
+        );
+        this.#refreshToken = undefined;
+        this.#authenticatedViaRefresh = false;
+      }
+
+      this.#errorCallback(error);
+    });
+
     // Start the socket when opened
     this.#ws.on("open", () => {
-      console.log('[Keepalive] WebSocket opened - starting ping/pong keepalive');
+      everOpened = true;
+      this.#log.info('WebSocket opened - starting ping/pong keepalive');
       this.#startSocket();
 
       // Send ping every 5 minutes
       pingInterval = setInterval(() => {
         if (this.#ws.readyState === WebSocket.OPEN) {
-          console.log('[Keepalive] Sending WebSocket ping...');
+          this.#log.debug('[Keepalive] Sending WebSocket ping...');
           this.#ws.ping();
 
           // Set timeout to detect if server doesn't respond
           pongTimeout = setTimeout(() => {
-            console.error('[Keepalive] Pong timeout - server not responding');
+            this.#log.warn('[Keepalive] Pong timeout - server not responding');
             this.#ws.terminate();
           }, 30000); // 30 second timeout
         }
@@ -350,7 +497,7 @@ class CieloAPIConnection {
 
     // Handle pong response
     this.#ws.on("pong", () => {
-      console.log('[Keepalive] Received pong from server');
+      this.#log.debug('[Keepalive] Received pong from server');
       if (pongTimeout) {
         clearTimeout(pongTimeout);
         pongTimeout = null;
@@ -359,28 +506,21 @@ class CieloAPIConnection {
 
     // Log errors for debugging
     this.#ws.on("error", (error) => {
-      console.error("WebSocket error:", error);
-      if (pingInterval) clearInterval(pingInterval);
-      if (pongTimeout) clearTimeout(pongTimeout);
-      this.#errorCallback(error);
+      this.#log.error("WebSocket error:", error.message);
+      notifyOnce(error);
     });
 
     // Provide notification to the error callback when the connection is
     // closed
     this.#ws.on("close", () => {
-      if (pingInterval) clearInterval(pingInterval);
-      if (pongTimeout) clearTimeout(pongTimeout);
-      this.#errorCallback(new Error("Connection Closed."));
+      notifyOnce(new Error("Connection Closed."));
     });
 
     // Subscribe to status updates
     this.#ws.on("message", (message) => {
       const data = JSON.parse(message);
 
-      // Write to debug log file
-      const fs = require('fs');
-      const debugLog = `\n[${new Date().toISOString()}] RECEIVED MESSAGE:\n${JSON.stringify(data, null, 2)}\n`;
-      fs.appendFileSync('cielo-debug.log', debugLog);
+      this.#log.debug("Received message:", JSON.stringify(data));
 
       // New API uses message_type field to identify message type
       if (
@@ -528,7 +668,7 @@ class CieloAPIConnection {
         return initialLoginData;
       })
       .catch((error) => {
-        console.error("Login error:", error);
+        this.#log.error("Login error:", error.message || error);
         throw error;
       });
     return loginData;
@@ -575,7 +715,7 @@ class CieloAPIConnection {
         return responseJSON;
       })
       .catch((error) => {
-        console.error(error);
+        this.#log.error("Failed to fetch device list:", error.message || error);
         return;
       });
     return devicesData;
@@ -605,7 +745,7 @@ class CieloAPIConnection {
    */
   async #pingSocket() {
     if (!this.#refreshToken) {
-      console.warn('No refresh token available for keepalive ping');
+      this.#log.warn('No refresh token available for keepalive ping');
       return;
     }
 
@@ -652,16 +792,16 @@ class CieloAPIConnection {
         const expires = new Date(responseJSON.data.expiresIn * 1000);
         const diffMinutes = Math.round((expires - time) / 60000);
 
-        console.log(
+        this.#log.debug(
           `[Keepalive] Token refreshed successfully - expires in ${diffMinutes} minutes`
         );
         return responseJSON;
       } else {
-        console.error('[Keepalive] Token refresh failed:', responseJSON.message || 'Unknown error');
+        this.#log.error('[Keepalive] Token refresh failed:', responseJSON.message || 'Unknown error');
         throw new Error('Token refresh failed');
       }
     } catch (error) {
-      console.error('[Keepalive] Error refreshing token:', error.message);
+      this.#log.error('[Keepalive] Error refreshing token:', error.message);
       // Don't throw - let the normal error handling reconnect if needed
       return null;
     }
@@ -772,15 +912,22 @@ class CieloAPIConnection {
   async sendCommand(hvac, performedAction, performedActionValue) {
     const payload = this.#buildCommandPayload(hvac, performedAction, performedActionValue);
 
-    // Write to debug log file
-    const fs = require('fs');
-    const debugLog = `\n[${new Date().toISOString()}] SENDING COMMAND:\n${JSON.stringify(JSON.parse(payload), null, 2)}\n`;
-    fs.appendFileSync('cielo-debug.log', debugLog);
+    this.#log.debug("Sending command:", payload);
+
+    // Sending on a socket that is not OPEN either throws synchronously or
+    // never invokes the callback, which surfaced as commands that HomeKit
+    // reported as successful but that never reached the unit. Fail loudly
+    // instead so the caller can queue and retry the command.
+    if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(
+        new Error("Connection Closed. Cannot send command - WebSocket is not open.")
+      );
+    }
 
     return new Promise((resolve, reject) => {
       this.#ws.send(payload, (error) => {
         if (error) {
-          fs.appendFileSync('cielo-debug.log', `ERROR: ${error.message}\n`);
+          this.#log.error("Failed to send command:", error.message);
           reject(error);
         } else {
           resolve();
@@ -1002,4 +1149,7 @@ class CieloHVAC {
 module.exports = {
   CieloHVAC: CieloHVAC,
   CieloAPIConnection: CieloAPIConnection,
+  // Exported for testing the single-report guarantee that keeps one dropped
+  // connection from being billed as two captcha solves.
+  createSingleShotNotifier: createSingleShotNotifier,
 };

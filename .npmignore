@@ -41,3 +41,6 @@ curl-examples.txt
 # Git files
 .git/
 .gitignore
+
+# Tests (development only)
+tests/
