@@ -974,7 +974,7 @@ class CieloAPIConnection {
       applianceId: hvac.getApplianceID(),
       actionType: performedAction,
       actionValue: performedActionValue,
-      connection_source: 0,
+      connection_source: 1,
       user_id: this.#userID,
       preset: 0,
       oldPower: oldPower,
