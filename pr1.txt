@@ -1,0 +1,26 @@
+The login path sets #userID from the login response, but refreshAccessToken never does. So refresh-login sessions send commands with user_id: undefined, and the Cielo server silently drops them.
+
+This is the root cause of a "second-class session" bug. After a token refresh, the connection can still receive broadcasts (ambient updates) but cannot send commands. Every command is discarded because the server doesn't know which user account to apply it to.
+
+The fix is to include #userID with the refreshAccessToken, when the access token is refreshed. The userID can be retrieved from he device list response, which a refreshed session can already call:
+
+  try {
+    if (!this.#userID) {
+      const devs = await this.#getDeviceInfo();
+      const uid = devs?.data?.listDevices?.[0]?.userId;
+      if (uid) {
+        this.#userID = uid;
+        this.#log.info('[Refresh] userID restored from device list: ' + uid);
+      } else {
+        this.#log.warn('[Refresh] no userId found in device list response');
+      }
+    }
+  } catch (e) {
+    this.#log.warn('[Refresh] userID restore failed: ' + e.message);
+  }
+
+#getDeviceInfo() is a single GET with the existing token, and the guard (!this.#userID) means it runs only once per refresh-login session. The userID persists across rotations and renewals.
+
+Evidence: before the fix, refresh-login sessions dropped all commands silently. After: 14+ hours of refresh-login sessions, zero command drops, zero captcha solves required.
+
+About 14 lines including comments, one function.
