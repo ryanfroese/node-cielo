@@ -93,6 +93,7 @@ class CieloAPIConnection {
   // Connection information
   #sessionID;
   #userID;
+  #lastFrameState;
   #accessToken;
   #refreshToken;
   #expiresIn;
@@ -599,9 +600,56 @@ class CieloAPIConnection {
 
         // Handle StateUpdate messages (replaces both WEB and Heartbeat)
         if (messageType === "StateUpdate") {
-          // Update HVAC state
+          // Delta-aware state logging: every StateUpdate frame is a full state
+          // report, not just a temperature. Diff against previous hvac state
+          // and the per-MAC frame cache; every frame gets one info line.
           this.hvacs.forEach((hvac, index) => {
             if (hvac.getMacAddress() === thisMac) {
+              const prev = {
+                power: hvac.getPower ? String(hvac.getPower()) : undefined,
+                temp: hvac.getTemperature ? String(hvac.getTemperature()) : undefined,
+                mode: hvac.getMode ? String(hvac.getMode()) : undefined,
+                fanspeed: hvac.getFanSpeed ? String(hvac.getFanSpeed()) : undefined,
+              };
+              // Frame-level fields the HVAC object doesn't track (deltas read
+              // from the raw frame's own previous value cached below).
+              const next = {
+                power: String(status.power),
+                temp: String(status.temp),
+                mode: String(status.mode),
+                fanspeed: String(status.fanspeed),
+                swing: String(status.swing),
+                swinginternal: String(status.swinginternal),
+                turbo: String(status.turbo),
+                eco: String(status.eco_mode),
+                freeze: String(status.freeze_protection),
+                breeze: String(status.breeze_away),
+                activeclean: String(status.active_clean),
+                customdry: String(status.custom_dry),
+                fanspeedpct: String(status.fan_speed_percentage),
+                devicestatus: String(status.device_status),
+              };
+              const deltas = [];
+              for (const k of Object.keys(next)) {
+                if (prev[k] !== undefined && prev[k] !== next[k]) {
+                  deltas.push(`${k} ${prev[k]}->${next[k]}`);
+                }
+              }
+              // cache this frame's values for the next delta
+              this.#lastFrameState = this.#lastFrameState || {};
+              const last = this.#lastFrameState[thisMac] || {};
+              for (const k of Object.keys(next)) {
+                if (last[k] !== undefined && last[k] !== next[k] && !deltas.some(d => d.startsWith(k + ' '))) {
+                  deltas.push(`${k} ${last[k]}->${next[k]}`);
+                }
+                last[k] = next[k];
+              }
+              this.#lastFrameState[thisMac] = last;
+              const src = status.action_source || data.mid || 'unknown';
+              const roomT = data.lat_env_var && data.lat_env_var.temperature !== undefined
+                ? data.lat_env_var.temperature : 'unknown';
+              const parts = [`setpoint=${status.temp}\u00b0F`, `room=${roomT}\u00b0F`, ...deltas];
+              this.#log.info(`[State] ${data.device_name || thisMac}: ${parts.join(', ')} (source: ${src})`);
               this.hvacs[index].updateState(
                 status.power,
                 status.temp,
