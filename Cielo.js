@@ -1063,11 +1063,15 @@ class CieloHVAC {
     this.#applianceID = applianceID;
     this.#fwVersion = fwVersion;
 
-    if (deviceTypeVersion && (deviceTypeVersion.startsWith("BI") || deviceTypeVersion.startsWith("BP"))) {
+    // Use whatever the API reports. The server silently ignores commands whose
+    // deviceTypeVersion doesn't match the unit, so substituting a "known" value
+    // for an unfamiliar family (as BB12, the Breez Eco, used to get BP01) makes
+    // the unit read-only rather than safer.
+    if (deviceTypeVersion) {
       this.#deviceTypeVersion = deviceTypeVersion;
     } else {
-      // Defaults back to BP01 if the deviceTypeVersion is not valid
-      console.warn(`Invalid deviceTypeVersion: ${deviceTypeVersion}, defaulting to BP01`);
+      // Defaults back to BP01 if the deviceTypeVersion is missing
+      console.warn(`Missing deviceTypeVersion, defaulting to BP01`);
       this.#deviceTypeVersion = "BP01";
     }
   }

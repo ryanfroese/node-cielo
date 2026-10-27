@@ -18,7 +18,7 @@ name.
 ### Installation and tests
 ```bash
 npm install
-npm test        # regression tests for the captcha-spend defects
+npm test        # regression tests (captcha spend, secrets, deviceTypeVersion)
 ```
 
 ### Running the Demo
@@ -92,8 +92,10 @@ Commands are sent via WebSocket using JSON payloads built by `#buildCommandPaylo
 
 The `deviceTypeVersion` field (e.g., "BI01", "BI02") is critical for API compatibility:
 - Retrieved from device info during subscription
-- Must start with "BI" or "BP" (validated in the CieloHVAC constructor)
-- Defaults to "BP01" if invalid or missing
+- Passed through as the API reports it, whatever the family (BI, BP, BB, ...)
+- Defaults to "BP01" only if missing. Never substitute a "known" value for an
+  unfamiliar one: the server silently ignores commands whose type doesn't match
+  the unit (a Breez Eco, BB12, sent as BP01 showed state but never obeyed)
 - Passed to API in all command payloads
 - Recent fix (PR #1) ensured this field is properly passed through to API
 

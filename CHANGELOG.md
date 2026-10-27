@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 See `API_STATUS.md` for the current state of the Cielo API, including which
 endpoints work, which are misleading, and how the findings were verified.
 
+## [Unreleased]
+
+### Fixed
+
+- **Commands to units outside the BI/BP families were silently ignored.** The
+  `deviceTypeVersion` reported by the API was only kept if it started with `BI`
+  or `BP`; anything else was replaced with `BP01`. The server drops commands
+  whose type doesn't match the unit - no error, no `StateUpdate` - so a Breez
+  Eco (`BB12`) showed its state in Homebridge but never obeyed a command. The
+  reported value is now passed through as-is; `BP01` remains the fallback when
+  it is missing.
+
 ## [2.2.1] - 2026-08-31
 
 ### Fixed
